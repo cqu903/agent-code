@@ -24,3 +24,5 @@ agent_code/.env
 # LLM interaction logs
 logs/
 .cursor/rules/codegraph.mdc
+
+uv.lock
