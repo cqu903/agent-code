@@ -5,6 +5,7 @@ from typing import Any, Callable
 from datetime import datetime
 
 from rich.console import Console
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ToolFunc = Callable[[dict[str, Any]], str]
 
@@ -38,7 +39,16 @@ def echo(args: dict[str, Any]) -> str:
 
 
 def system_date(args: dict[str, Any]) -> str:
-    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    tz_time = args.get("timezone")
+    if tz_time:
+        try:
+            tz = ZoneInfo(tz_time)
+        except ZoneInfoNotFoundError:
+            return f"unknown timezone: {tz_time}"
+        now = datetime.now(tz)
+    else:
+        now = datetime.now().astimezone()
+    return now.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def uppercase(args: dict[str, Any]) -> str:
@@ -110,6 +120,16 @@ def default_tools() -> ToolRegistry:
             name="system_date",
             description="Return the current system date and time.",
             run=system_date,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "Optional IANA timezone name (e.g. UTC, Asia/Shanghai, America/New_York). Defaults to the system local timezone.",
+                    }
+                },
+                "required": [],
+            },
         )
     )
     return registry
