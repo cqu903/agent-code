@@ -8,21 +8,21 @@ from typing import Any, Protocol
 from anthropic import Anthropic
 
 from .llm_log import LLMLogger
+from .messages import Message
 from .tools import Tool, ToolCall
 
 
 @dataclass
 class ModelResponse:
-    # 一次模型响应可以是最终文本，也可以是工具调用。
     text: str | None = None
     tool_calls: list[ToolCall] | None = None
-    assistant_content: list[dict[str, Any]] | None = None
+    provider_data: dict[str, Any] | None = None
     stop_reason: str = "end_turn"
 
 
 class Provider(Protocol):
     def complete(
-        self, messages: list[dict[str, str]], tools: list[Tool] | None = None
+        self, messages: list[Message], tools: list[Tool] | None = None
     ) -> ModelResponse: ...
 
 
@@ -72,18 +72,73 @@ class AnthropicProvider:
                 data[name] = getattr(block, name)
         return data
 
+    def _build_assistant_wire(self, message: Message) -> dict[str, Any]:
+        content: list[dict[str, Any]] = []
+        if message.text:
+            content.append({"type": "text", "text": message.text})
+        for call in message.tool_calls or []:
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }
+            )
+        return {"role": "assistant", "content": content}
+
+    def _to_wire_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
+        wire: list[dict[str, Any]] = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            if message.role == "user":
+                wire.append({"role": "user", "content": message.text or ""})
+                index += 1
+                continue
+
+            if message.role == "assistant":
+                if message.provider_data and "content" in message.provider_data:
+                    wire.append(
+                        {
+                            "role": "assistant",
+                            "content": message.provider_data["content"],
+                        }
+                    )
+                else:
+                    wire.append(self._build_assistant_wire(message))
+                index += 1
+                continue
+
+            if message.role == "tool":
+                tool_results: list[dict[str, Any]] = []
+                while index < len(messages) and messages[index].role == "tool":
+                    tool_message = messages[index]
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_message.tool_call_id,
+                            "content": tool_message.content or "",
+                            "is_error": tool_message.is_error,
+                        }
+                    )
+                    index += 1
+                wire.append({"role": "user", "content": tool_results})
+                continue
+
+            index += 1
+        return wire
+
     def complete(
-        self, messages: list[dict[str, str]], tools: list[Tool] | None = None
+        self, messages: list[Message], tools: list[Tool] | None = None
     ) -> ModelResponse:
-        # 先准备一次模型请求的基础参数，messages是Agent Loop累积出来的上下文
+        wire_messages = self._to_wire_messages(messages)
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "messages": messages,
+            "messages": wire_messages,
         }
 
-        # 如果registry里有工具，就把Tool翻译成Anthropic的tools格式
-        # 这里只是告诉模型有哪些工具
         if tools:
             kwargs["tools"] = self._to_anthropic_tools(tools)
 
@@ -103,21 +158,16 @@ class AnthropicProvider:
                 duration_ms=duration_ms,
             )
 
-        # Claude/DeepSeek 可能同时返回 text block 和 tool_use block。
-        # text_parts 收集普通回答；tool_calls 收集"模型想调用工具"的请求
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         assistant_content: list[dict[str, Any]] = []
 
         for block in response.content:
-            # 原样保存 assistant content，后面 agent.py 会把它放回 messages。
-            # 这能保留 thinking / signature 等额外 block，避免下一轮请求丢上下文。
             assistant_content.append(self._content_block_to_dict(block))
 
             if block.type == "text":
                 text_parts.append(block.text)
             elif block.type == "tool_use":
-                # provider只负责把外部协议翻译成内部的ToolCall
                 tool_calls.append(
                     ToolCall(
                         id=block.id,
@@ -125,9 +175,11 @@ class AnthropicProvider:
                         arguments=self._parse_tool_input(block.input),
                     )
                 )
+
+        provider_data = {"content": assistant_content} if assistant_content else None
         return ModelResponse(
             text="\n".join(text_parts) or None,
             tool_calls=tool_calls or None,
-            assistant_content=assistant_content or None,
+            provider_data=provider_data,
             stop_reason=response.stop_reason or "end_turn",
         )
