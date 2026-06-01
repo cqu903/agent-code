@@ -34,7 +34,6 @@ def handle_slash(line: str) -> bool:
 
 
 def run_once(prompt: str, cwd: Path, log_dir: Path | None) -> None:
-    render_header(cwd)
     llm_logger = create_llm_logger(log_dir)
     if llm_logger:
         console.print(f"[dim]llm log: {llm_logger.path}[/dim]\n")
