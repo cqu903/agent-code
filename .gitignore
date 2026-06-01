@@ -19,6 +19,7 @@ agent_code/.env
 # Local tooling
 .codegraph/
 .remember/
+.worktrees/
 
 # LLM interaction logs
 logs/
