@@ -2,20 +2,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .model import MockProvider
+from .model import Provider
 from .tools import ToolRegistry
+
 
 @dataclass
 class AgentResult:
     final: str
     trace: list[str]
 
-def run_agent(prompt:str,provider:MockProvider,tools:ToolRegistry)->AgentResult:
-    #messages 是每一轮都要交回provider的上下文
+
+def run_agent(prompt: str, provider: Provider, tools: ToolRegistry) -> AgentResult:
+    # messages 是每一轮都要交回provider的上下文
     messages = [{"role": "user", "content": prompt}]
     trace: list[str] = []
 
-    response = provider.complete(messages)
+    response = provider.complete(messages, tools)
 
     for call in response.tool_calls or []:
         trace.append(f"tool_call: {call.name} {call.arguments}")
@@ -27,11 +29,11 @@ def run_agent(prompt:str,provider:MockProvider,tools:ToolRegistry)->AgentResult:
             {
                 "role": "tool",
                 "tool_call_id": result.tool_call_id,
-                "content": result.content
+                "content": result.content,
             }
         )
-        response = provider.complete(messages)
+        response = provider.complete(messages, tools)
 
     final = response.text or ""
     trace.append(f"final: {final}")
-    return AgentResult(final=final,trace=trace)
+    return AgentResult(final=final, trace=trace)
