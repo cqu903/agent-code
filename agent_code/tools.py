@@ -1,13 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
+from datetime import datetime
 
 from rich.console import Console
 
-from .model import ToolCall, ToolResult
-
 ToolFunc = Callable[[dict[str, Any]], str]
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ToolResult:
+    tool_call_id: str
+    content: str
+    is_error: bool = False
 
 
 @dataclass
@@ -15,10 +28,17 @@ class Tool:
     name: str
     description: str
     run: ToolFunc
+    parameters: dict[str, Any] = field(
+        default_factory=lambda: {"type": "object", "properties": {}, "required": []}
+    )
 
 
 def echo(args: dict[str, Any]) -> str:
     return str(args.get("text", ""))
+
+
+def system_date(args: dict[str, Any]) -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def uppercase(args: dict[str, Any]) -> str:
@@ -47,6 +67,9 @@ class ToolRegistry:
             content=tool.run(call.arguments),
         )
 
+    def list(self) -> list[Tool]:
+        return list(self._tools.values())
+
     def print_help(self, console: Console | None = None) -> None:
         out = console or Console()
         out.print("[bold]Available tools:[/bold]")
@@ -61,12 +84,32 @@ class ToolRegistry:
 def default_tools() -> ToolRegistry:
     # 后续会加入文件工具和bash工具
     registry = ToolRegistry()
-    registry.register(Tool(name="echo", description="Return the input text", run=echo))
+    registry.register(
+        Tool(
+            name="echo",
+            description="Return the input text",
+            run=echo,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to return."}
+                },
+                "required": ["text"],
+            },
+        )
+    )
     registry.register(
         Tool(
             name="uppercase",
             description="Return the uppercase of the input text",
             run=uppercase,
+        )
+    )
+    registry.register(
+        Tool(
+            name="system_date",
+            description="Return the current system date and time.",
+            run=system_date,
         )
     )
     return registry

@@ -6,11 +6,11 @@ import typer
 from dotenv import load_dotenv
 from rich.console import Console
 from .agent import run_agent
+from .llm_log import create_llm_logger
 from .model import AnthropicProvider
 from .tools import default_tools
 
 console = Console()
-app = typer.Typer(add_completion=False)
 tool_registry = default_tools()
 
 
@@ -33,17 +33,26 @@ def handle_slash(line: str) -> bool:
     return False
 
 
-def run_once(prompt: str, cwd: Path) -> None:
+def run_once(prompt: str, cwd: Path, log_dir: Path | None) -> None:
     render_header(cwd)
-    result = run_agent(prompt, AnthropicProvider(), tool_registry)
+    llm_logger = create_llm_logger(log_dir)
+    if llm_logger:
+        console.print(f"[dim]llm log: {llm_logger.path}[/dim]\n")
+    provider = AnthropicProvider(llm_logger=llm_logger)
+    result = run_agent(prompt, provider, tool_registry)
     for line in result.trace:
         console.print(line)
 
 
-@app.callback(invoke_without_command=True)
 def main_command(
     prompt: str = typer.Argument("", help="Prompt to send to the agent."),
     cwd: Path = typer.Option(Path.cwd(), "--cwd", "-C"),
+    log_dir: Path | None = typer.Option(
+        None,
+        "--log-dir",
+        help="Directory for LLM request/response JSONL logs.",
+        envvar="AGENT_CODE_LOG_DIR",
+    ),
 ) -> None:
     # 启动时只解析一次cwd，让整个运行共享同一个工作目录
     resolved_cwd = cwd.resolve()
@@ -51,7 +60,7 @@ def main_command(
 
     if text:
         # 有prompt参数时进入一次性模式，运行一次就退出
-        run_once(text, resolved_cwd)
+        run_once(text, resolved_cwd, log_dir)
         return
     # 注释1: REPL分支——命令后没跟prompt，走下面交互循环
     render_header(resolved_cwd)
@@ -65,9 +74,9 @@ def main_command(
             return
         if line.startswith("/") and handle_slash(line):
             continue
-        run_once(line, resolved_cwd)
+        run_once(line, resolved_cwd, log_dir)
 
 
 def main() -> None:
     load_env()
-    app()
+    typer.run(main_command)

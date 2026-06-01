@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
-from .model import Provider
+from .model import Provider, ModelResponse
 from .tools import ToolRegistry
 
 
@@ -10,30 +11,68 @@ from .tools import ToolRegistry
 class AgentResult:
     final: str
     trace: list[str]
+    messages: list[dict[str, Any]]
 
 
-def run_agent(prompt: str, provider: Provider, tools: ToolRegistry) -> AgentResult:
-    # messages 是每一轮都要交回provider的上下文
-    messages = [{"role": "user", "content": prompt}]
-    trace: list[str] = []
-
-    response = provider.complete(messages, tools)
-
+def _assistant_message(response: ModelResponse) -> dict[str, Any]:
+    if response.assistant_content:
+        return {"role": "assistant", "content": response.assistant_content}
+    content: list[dict[str, Any]] = []
+    if response.text:
+        content.append({"type": "text", "text": response.text})
     for call in response.tool_calls or []:
-        trace.append(f"tool_call: {call.name} {call.arguments}")
-
-        result = tools.run(call)
-        trace.append(f"observation: {result.content}")
-        # 工具结果会成为下一轮模型调用的observation
-        messages.append(
+        content.append(
             {
-                "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "content": result.content,
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": call.arguments,
             }
         )
-        response = provider.complete(messages, tools)
+    return {"role": "assistant", "content": content}
 
-    final = response.text or ""
+
+def _tool_result_message(
+    tool_call_id: str, content: str, is_error: bool = False
+) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": content,
+                "is_error": is_error,
+            }
+        ],
+    }
+
+
+def run_agent(
+    prompt: str, provider: Provider, tools: ToolRegistry, max_steps: int = 99
+) -> AgentResult:
+    # messages 是每一轮都要交回provider的上下文
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    trace: list[str] = []
+
+    for step in range(max_steps):
+        response = provider.complete(messages, tools=tools.list())
+        messages.append(_assistant_message(response))
+
+        if not response.tool_calls:
+            final = response.text or ""
+            trace.append(f"final: {final}")
+            return AgentResult(final=final, trace=trace, messages=messages)
+        for call in response.tool_calls:
+            trace.append(f"tool_call: {call.name} {call.arguments}")
+            result = tools.run(call)
+            trace.append(f"observation: {result.content}")
+            messages.append(
+                _tool_result_message(
+                    result.tool_call_id, result.content, result.is_error
+                )
+            )
+
+    final = f"reached max_steps={max_steps}"
     trace.append(f"final: {final}")
-    return AgentResult(final=final, trace=trace)
+    return AgentResult(final=final, trace=trace, messages=messages)
