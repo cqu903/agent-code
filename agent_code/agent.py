@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from .messages import Message
 from .model import Provider
-from .tools import ToolRegistry
+from .tools import ToolRegistry, ToolContext
+from .fs_safety import SkipPolicy, load_gitignore
 
 
 @dataclass
@@ -15,8 +17,18 @@ class AgentResult:
 
 
 def run_agent(
-    prompt: str, provider: Provider, tools: ToolRegistry, max_steps: int = 99
+    prompt: str,
+    provider: Provider,
+    tools: ToolRegistry,
+    max_steps: int = 99,
+    cwd: Path | None = None,
 ) -> AgentResult:
+    resolved_cwd = cwd or Path.cwd()
+    ctx = ToolContext(
+        cwd=resolved_cwd,
+        skip_policy=SkipPolicy.default(gitignore=load_gitignore(resolved_cwd)),
+    )
+
     messages: list[Message] = [Message(role="user", text=prompt)]
     trace: list[str] = []
 
@@ -38,7 +50,7 @@ def run_agent(
 
         for call in response.tool_calls:
             trace.append(f"tool_call: {call.name} {call.arguments}")
-            result = tools.run(call)
+            result = tools.run(call, ctx)
             trace.append(f"observation: {result.content}")
             messages.append(
                 Message(

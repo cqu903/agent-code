@@ -38,7 +38,7 @@ def run_once(prompt: str, cwd: Path, log_dir: Path | None) -> None:
     if llm_logger:
         console.print(f"[dim]llm log: {llm_logger.path}[/dim]\n")
     provider = AnthropicProvider(llm_logger=llm_logger)
-    result = run_agent(prompt, provider, tool_registry)
+    result = run_agent(prompt, provider, tool_registry, cwd=cwd)
     for line in result.trace:
         console.print(line)
 
