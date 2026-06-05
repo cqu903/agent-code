@@ -415,6 +415,24 @@ def web_search(args: dict[str, Any], ctx: ToolContext) -> str:
     return truncate_output("\n".join(lines))
 
 
+def file_write(args: dict[str, Any], ctx: ToolContext) -> str:
+    """整文件覆盖写入，前置校验由agent.py拦截块完成"""
+    path_str = args.get("file_path", "")
+    content = args.get("content", "")
+    if not path_str:
+        return "error: missing required argument 'file_path'"
+    try:
+        path = resolve_in_cwd(ctx.cwd, path_str)
+    except ValueError as exc:
+        return f"error: {exc}"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    # 写盘后刷新 read_state，让下一次编辑基于最新内容
+    ctx.read_state.record(path, content)
+    return f"Wrote {len(content)} chars to {path_str}"
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         # 注册表是工具名和python函数之间的harness边界
@@ -611,6 +629,27 @@ def default_tools() -> ToolRegistry:
                     },
                 },
                 "required": ["query"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="file_write",
+            description="Write or overwrite a file. Path is relative to cwd.",
+            run=file_write,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Relative path inside cwd.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full file content to write.",
+                    },
+                },
+                "required": ["file_path", "content"],
             },
         )
     )
