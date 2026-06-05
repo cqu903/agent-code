@@ -20,5 +20,8 @@ dependencies = [
 [project.scripts]
 agent-code = "agent_code.cli:main"
 
+[tool.black]
+target-version = ["py312"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["agent_code"]

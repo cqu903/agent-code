@@ -24,3 +24,7 @@ agent_code/.env
 # LLM interaction logs
 logs/
 .cursor/rules/codegraph.mdc
+
+.agent/
+dup.txt
+hello.txt

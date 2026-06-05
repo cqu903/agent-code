@@ -27,3 +27,7 @@ def render_diff(old: str, new: str, path: str) -> str:
         else:
             colored.append(line)
     return "\n".join(colored)
+
+def confirm_edit(path: str)->bool:
+    """让用户确认是否应用这次编辑，默认不应用"""
+    return typer.confirm(f"Apply this edit to {path}?, default=False")
