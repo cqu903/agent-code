@@ -65,10 +65,58 @@ class Tool:
     )
 
 
+_REGISTERED_TOOLS: list[Tool] = []
+
+
+def register_tool(
+    name: str,
+    description: str,
+    parameters: dict[str, Any] | None = None,
+) -> Callable[[ToolFunc], ToolFunc]:
+    def decorator(fn: ToolFunc) -> ToolFunc:
+        _REGISTERED_TOOLS.append(
+            Tool(
+                name=name,
+                description=description,
+                run=fn,
+                parameters=parameters
+                or {"type": "object", "properties": {}, "required": []},
+            )
+        )
+        return fn
+
+    return decorator
+
+
+@register_tool(
+    name="echo",
+    description="Return the input text",
+    parameters={
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Text to return."}
+        },
+        "required": ["text"],
+    },
+)
 def echo(args: dict[str, Any], ctx: ToolContext) -> str:
     return str(args.get("text", ""))
 
 
+@register_tool(
+    name="system_date",
+    description="Return the current system date and time.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "timezone": {
+                "type": "string",
+                "description": "Optional IANA timezone name (e.g. UTC, Asia/Shanghai, America/New_York). Defaults to the system local timezone.",
+            }
+        },
+        "required": [],
+    },
+)
 def system_date(args: dict[str, Any], ctx: ToolContext) -> str:
     tz_time = args.get("timezone")
     if tz_time:
@@ -82,6 +130,20 @@ def system_date(args: dict[str, Any], ctx: ToolContext) -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+@register_tool(
+    name="read_file",
+    description="Read a text file inside the project. Path is relative to cwd.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative path inside cwd.",
+            },
+        },
+        "required": ["path"],
+    },
+)
 def read_file(args: dict[str, Any], ctx: ToolContext) -> str:
     # 模型给出相对路径，fs_safety将路径锁回cwd内，探测二进制再卡大小上限
     path_str = args.get("path", "")
@@ -99,6 +161,21 @@ def read_file(args: dict[str, Any], ctx: ToolContext) -> str:
     return truncate_output(text)
 
 
+@register_tool(
+    name="list_files",
+    description="List files and directories at a path inside cwd.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative path; defaults to '.'.",
+                "default": ".",
+            },
+        },
+        "required": [],
+    },
+)
 def list_files(args: dict[str, Any], ctx: ToolContext) -> str:
     path_str = args.get("path", ".")
     try:
@@ -116,6 +193,17 @@ def list_files(args: dict[str, Any], ctx: ToolContext) -> str:
     return truncate_output("\n".join(entries) or "(empty)")
 
 
+@register_tool(
+    name="glob",
+    description="Find files by glob pattern, e.g. '**/*.py'.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Glob pattern."},
+        },
+        "required": ["pattern"],
+    },
+)
 def glob(args: dict[str, Any], ctx: ToolContext) -> str:
     pattern = args.get("pattern", "")
     if not pattern:
@@ -137,6 +225,31 @@ def glob(args: dict[str, Any], ctx: ToolContext) -> str:
     return truncate_output("\n".join(lines) or "(no matches)")
 
 
+@register_tool(
+    name="grep",
+    description="Search file contents with a regular expression (ripgrep if available).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Regular expression."},
+            "path": {
+                "type": "string",
+                "description": "Relative path; defaults to '.'.",
+                "default": ".",
+            },
+            "glob": {
+                "type": "string",
+                "description": "Optional file glob filter, e.g. '*.py'.",
+            },
+            "ignore_case": {
+                "type": "boolean",
+                "description": "Case-insensitive match.",
+                "default": False,
+            },
+        },
+        "required": ["pattern"],
+    },
+)
 def grep(args: dict[str, Any], ctx: ToolContext) -> str:
     pattern = args.get("pattern", "")
     if not pattern:
@@ -234,6 +347,21 @@ def _grep_python(
     return truncate_output("\n".join(hits) or "(no matches)")
 
 
+@register_tool(
+    name="project_tree",
+    description="Show the project directory tree from cwd.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "max_depth": {
+                "type": "integer",
+                "description": "Maximum recursion depth.",
+                "default": 3,
+            },
+        },
+        "required": [],
+    },
+)
 def project_tree(args: dict[str, Any], ctx: ToolContext) -> str:
     max_depth = int(args.get("max_depth", 5))
     max_nodes = 200
@@ -306,6 +434,17 @@ def _html_to_markdown(html: str) -> str:
     return converter.handle(html).strip()
 
 
+@register_tool(
+    name="web_fetch",
+    description="Fetch a URL and return its content as markdown (or raw text).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Absolute http(s) URL."},
+        },
+        "required": ["url"],
+    },
+)
 def web_fetch(args: dict[str, Any], ctx: ToolContext) -> str:
     url = args.get("url", "")
     if not url:
@@ -384,6 +523,22 @@ def _tavily_search(query: str, max_results: int) -> list[dict[str, str]]:
     return results
 
 
+@register_tool(
+    name="web_search",
+    description="Search the web (Tavily) and return top results.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query."},
+            "max_results": {
+                "type": "integer",
+                "description": "How many results to return (1-10).",
+                "default": 5,
+            },
+        },
+        "required": ["query"],
+    },
+)
 def web_search(args: dict[str, Any], ctx: ToolContext) -> str:
     query = args.get("query", "")
     if not query:
@@ -418,6 +573,24 @@ def web_search(args: dict[str, Any], ctx: ToolContext) -> str:
     return truncate_output("\n".join(lines))
 
 
+@register_tool(
+    name="file_write",
+    description="Write or overwrite a file. Path is relative to cwd.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Relative path inside cwd.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Full file content to write.",
+            },
+        },
+        "required": ["file_path", "content"],
+    },
+)
 def file_write(args: dict[str, Any], ctx: ToolContext) -> str:
     """整文件覆盖写入，前置校验由agent.py拦截块完成"""
     path_str = args.get("file_path", "")
@@ -442,6 +615,37 @@ def file_write(args: dict[str, Any], ctx: ToolContext) -> str:
     return f"Wrote {len(content)} chars to {path_str}"
 
 
+@register_tool(
+    name="file_edit",
+    description=(
+        "Edit a file by replacing old_string with new_string. "
+        "old_string must be unique in the file (or use replace_all=True). "
+        "You must read the file before editing."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Relative path inside cwd.",
+            },
+            "old_string": {
+                "type": "string",
+                "description": "Exact string to replace. Must match including whitespace and indentation.",
+            },
+            "new_string": {
+                "type": "string",
+                "description": "String to replace it with.",
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "Replace all occurrences. Default false.",
+                "default": False,
+            },
+        },
+        "required": ["file_path", "old_string", "new_string"],
+    },
+)
 def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
     """字符串替换编辑。前置校验在 agent.py 拦截块里完成。"""
     path_str = args.get("file_path", "")
@@ -474,16 +678,52 @@ def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
     return f"Edited {path_str}: replaced {len(old_string)} chars with {len(new_string)} chars"
 
 
+@register_tool(
+    name="git_status",
+    description="Run git status to see the current state of the working directory.",
+)
 def _git_status(args: dict[str, Any], ctx: ToolContext) -> str:
     """薄包装 git status 只读，默认 allow"""
     return _bash_run_sync("git status", ctx.cwd, timeout=10)
 
 
+@register_tool(
+    name="git_diff",
+    description="Run git diff to see unstaged changes in the working directory.",
+)
 def _git_diff(args: dict[str, Any], ctx: ToolContext) -> str:
     """薄包装 git diff——只读、默认 allow。"""
     return _bash_run_sync("git diff", ctx.cwd, timeout=10)
 
 
+@register_tool(
+    name="bash",
+    description=(
+        "Execute a shell command. Working directory persists but shell state "
+        "does not (each call is a fresh shell). timeout in seconds (default 30). "
+        "Avoid cd; use the tool's implicit cwd instead."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Shell command to execute.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds, default 30.",
+                "default": 30,
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Run in background. Returns immediately with a background_id. Default false.",
+                "default": False,
+            },
+        },
+        "required": ["command"],
+    },
+)
 def bash(args: dict[str, Any], ctx: ToolContext) -> str:
     """执行 shell 命令，前置校验和用户确认在agent.py拦截块完成"""
     command = args.get("command", "")
@@ -535,268 +775,7 @@ class ToolRegistry:
 
 
 def default_tools() -> ToolRegistry:
-    # 后续会加入文件工具和bash工具
     registry = ToolRegistry()
-    registry.register(
-        Tool(
-            name="echo",
-            description="Return the input text",
-            run=echo,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Text to return."}
-                },
-                "required": ["text"],
-            },
-        )
-    )
-
-    registry.register(
-        Tool(
-            name="system_date",
-            description="Return the current system date and time.",
-            run=system_date,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "timezone": {
-                        "type": "string",
-                        "description": "Optional IANA timezone name (e.g. UTC, Asia/Shanghai, America/New_York). Defaults to the system local timezone.",
-                    }
-                },
-                "required": [],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="read_file",
-            description="Read a text file inside the project. Path is relative to cwd.",
-            run=read_file,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path inside cwd.",
-                    },
-                },
-                "required": ["path"],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="list_files",
-            description="List files and directories at a path inside cwd.",
-            run=list_files,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path; defaults to '.'.",
-                        "default": ".",
-                    },
-                },
-                "required": [],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="glob",
-            description="Find files by glob pattern, e.g. '**/*.py'.",
-            run=glob,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Glob pattern."},
-                },
-                "required": ["pattern"],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="grep",
-            description="Search file contents with a regular expression (ripgrep if available).",
-            run=grep,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regular expression."},
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path; defaults to '.'.",
-                        "default": ".",
-                    },
-                    "glob": {
-                        "type": "string",
-                        "description": "Optional file glob filter, e.g. '*.py'.",
-                    },
-                    "ignore_case": {
-                        "type": "boolean",
-                        "description": "Case-insensitive match.",
-                        "default": False,
-                    },
-                },
-                "required": ["pattern"],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="project_tree",
-            description="Show the project directory tree from cwd.",
-            run=project_tree,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "max_depth": {
-                        "type": "integer",
-                        "description": "Maximum recursion depth.",
-                        "default": 3,
-                    },
-                },
-                "required": [],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="web_fetch",
-            description="Fetch a URL and return its content as markdown (or raw text).",
-            run=web_fetch,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Absolute http(s) URL."},
-                },
-                "required": ["url"],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="web_search",
-            description="Search the web (Tavily) and return top results.",
-            run=web_search,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query."},
-                    "max_results": {
-                        "type": "integer",
-                        "description": "How many results to return (1-10).",
-                        "default": 5,
-                    },
-                },
-                "required": ["query"],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="file_write",
-            description="Write or overwrite a file. Path is relative to cwd.",
-            run=file_write,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Relative path inside cwd.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Full file content to write.",
-                    },
-                },
-                "required": ["file_path", "content"],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="file_edit",
-            description=(
-                "Edit a file by replacing old_string with new_string. "
-                "old_string must be unique in the file (or use replace_all=True). "
-                "You must read the file before editing."
-            ),
-            run=file_edit,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Relative path inside cwd.",
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Exact string to replace. Must match including whitespace and indentation.",
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "String to replace it with.",
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "description": "Replace all occurrences. Default false.",
-                        "default": False,
-                    },
-                },
-                "required": ["file_path", "old_string", "new_string"],
-            },
-        )
-    )
-    registry.register(
-        Tool(
-            name="git_status",
-            description="Run git status to see the current state of the working directory.",
-            run=_git_status,
-            parameters={"type": "object", "properties": {}, "required": []},
-        )
-    )
-    registry.register(
-        Tool(
-            name="git_diff",
-            description="Run git diff to see unstaged changes in the working directory.",
-            run=_git_diff,
-            parameters={"type": "object", "properties": {}, "required": []},
-        )
-    )
-    registry.register(
-        Tool(
-            name="bash",
-            description=(
-                "Execute a shell command. Working directory persists but shell state "
-                "does not (each call is a fresh shell). timeout in seconds (default 30). "
-                "Avoid cd; use the tool's implicit cwd instead."
-            ),
-            run=bash,
-            parameters={
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command to execute.",
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Timeout in seconds, default 30.",
-                        "default": 30,
-                    },
-                    "background": {
-                        "type": "boolean",
-                        "description": "Run in background. Returns immediately with a background_id. Default false.",
-                        "default": False,
-                    },
-                },
-                "required": ["command"],
-            },
-        )
-    )
+    for tool in _REGISTERED_TOOLS:
+        registry.register(tool)
     return registry
