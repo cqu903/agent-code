@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .messages import Message
 from .model import Provider, ModelResponse
@@ -15,8 +16,8 @@ from .fs_safety import (
     resolve_in_cwd,
 )
 from rich.console import Console
-from .diff_ui import confirm_edit, render_diff
-from .prompt_ui import confirm_command
+from .prompt_ui import confirm_command, confirm_edit, confirm_tool_use, render_diff
+from .permissions import PermissionsRequest, decide_permission
 
 console = Console()
 
@@ -34,6 +35,7 @@ def run_agent(
     tools: ToolRegistry,
     max_steps: int = 99,
     cwd: Path | None = None,
+    permission_mode: Literal["default", "acceptEdits", "plan"] = "default",
 ) -> AgentResult:
     resolved_cwd = cwd or Path.cwd()
     ctx = ToolContext(
@@ -68,106 +70,164 @@ def run_agent(
         for call in response.tool_calls:
             emit(f"tool_call: {call.name} {call.arguments}")
 
-            if call.name in ("file_write", "file_edit"):
+            # 权限引擎统一入口：所有工具调用先包装成 PermissionRequest
+            request = PermissionsRequest(
+                tool_name=call.name,
+                args=call.arguments,
+                mode=permission_mode,
+                cwd=ctx.cwd,
+            )
+            decision = decide_permission(request)
+
+            edit_preview: tuple[str, str, str] | None = None
+            if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
+                # acceptEdits 只跳过确认 UI，不能跳过 Day 4 的安全校验
                 path_str = call.arguments.get("file_path", "")
-                # 路径解析，越界 cwd 直接当作 error
                 try:
                     path = resolve_in_cwd(ctx.cwd, path_str)
                 except (ValueError, OSError) as exc:
-                    result = ToolResult(
-                        tool_call_id=call.id, content=f"error: {exc}", is_error=True
-                    )
-                    emit(f"observation: {result.content}")
-                    messages.append(
-                        Message(
-                            role="tool",
-                            tool_call_id=call.id,
-                            content=result.content,
-                            is_error=result.is_error,
-                        )
-                    )
-                    continue
-                old_content = path.read_text(encoding="utf-8") if path.exists() else ""
-                # file_write前置校验，read-before-edit + mtime 冲突
-                validation_error: str | None = None
-                if call.name == "file_write":
-                    if path.exists():
-                        validation_error = ensure_read_before_edit(
-                            ctx.read_state, path
-                        ) or check_mtime_conflict(ctx.read_state, path)
-                else:
-                    if not path.exists():
-                        validation_error = f"error: file does not exist: {path_str}"
-                    else:
-                        validation_error = ensure_read_before_edit(
-                            ctx.read_state, path
-                        ) or check_mtime_conflict(ctx.read_state, path)
-                # 计算 new_content，file_write直接拿content; file_edit试跑替换
-                new_content: str | None = None
-                if call.name == "file_write":
-                    new_content = call.arguments.get("content", "")
-                elif call.name == "file_edit" and validation_error is None:
-                    new_content, replace_err = apply_single_replace(
-                        old_content,
-                        call.arguments.get("old_string", ""),
-                        call.arguments.get("new_string", ""),
-                        bool(call.arguments.get("replace_all", False)),
-                    )
-                    if replace_err is not None:
-                        validation_error = replace_err
-                # 校验失败：不渲染diff，不问用户，直接error observation返回给模型
-                if validation_error is not None:
-                    result = ToolResult(call.id, validation_error, is_error=True)
-                    emit(f"observation: {result.content}")
-                    messages.append(
-                        Message(
-                            role="tool",
-                            tool_call_id=call.id,
-                            content=result.content,
-                            is_error=result.is_error,
-                        )
-                    )
-                    continue
-                # 校验成功：渲染diff，问用户是否应用
-                if new_content is not None:
-                    diff_text = render_diff(old_content, new_content, path_str)
-                    console.print(f"\n[bold]Diff for {path_str}:[/bold]")
-                    console.print(diff_text)
-                    if not confirm_edit(path_str):
-                        result = ToolResult(
-                            call.id, "error: edit rejected by user", is_error=True
-                        )
-                        emit(f"observation: {result.content}")
-                        messages.append(
-                            Message(
-                                role="tool",
-                                tool_call_id=call.id,
-                                content=result.content,
-                                is_error=result.is_error,
-                            )
-                        )
-                        continue
-
-            # bash拦截：打印命令预览，让用户确认后执行
-            elif call.name == "bash":
-                command = call.arguments.get("command", "")
-                timeout = call.arguments.get("timeout", 30)
-                console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
-                console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
-                if not confirm_command(command):
-                    result = ToolResult(
-                        call.id, "error: command rejected by user", is_error=True
-                    )
+                    result = ToolResult(call.id, f"error: {exc}", is_error=True)
                     emit(f"observation: {result.content}")
                     messages.append(
                         Message(
                             role="tool",
                             tool_call_id=result.tool_call_id,
                             content=result.content,
-                            is_error=result.is_error,
+                            is_error=True,
                         )
                     )
                     continue
+
+                old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+
+                validation_error: str | None = None
+                if call.name == "file_write":
+                    if path.exists():
+                        validation_error = ensure_read_before_edit(
+                            ctx.read_state, path
+                        ) or check_mtime_conflict(ctx.read_state, path)
+                    new_content = call.arguments.get("content", "")
+                else:  # file_edit
+                    new_content = ""
+                    if not path.exists():
+                        validation_error = f"error: file does not exist: {path_str}"
+                    else:
+                        validation_error = ensure_read_before_edit(
+                            ctx.read_state, path
+                        ) or check_mtime_conflict(ctx.read_state, path)
+                    if validation_error is None:
+                        new_content, replace_err = apply_single_replace(
+                            old_content,
+                            call.arguments.get("old_string", ""),
+                            call.arguments.get("new_string", ""),
+                            bool(call.arguments.get("replace_all", False)),
+                        )
+                        if replace_err is not None:
+                            validation_error = replace_err
+
+                if validation_error is not None:
+                    result = ToolResult(call.id, validation_error, is_error=True)
+                    emit(f"observation: {result.content}")
+                    messages.append(
+                        Message(
+                            role="tool",
+                            tool_call_id=result.tool_call_id,
+                            content=result.content,
+                            is_error=True,
+                        )
+                    )
+                    continue
+
+                edit_preview = (path_str, old_content, new_content)
+
+            if decision.behavior == "deny":
+                # deny 路径：直接返回 error observation，不弹 UI
+                result = ToolResult(
+                    call.id, f"error: {decision.message}", is_error=True
+                )
+                emit(f"observation: {result.content}")
+                messages.append(
+                    Message(
+                        role="tool",
+                        tool_call_id=result.tool_call_id,
+                        content=result.content,
+                        is_error=True,
+                    )
+                )
+                continue
+
+            elif decision.behavior == "ask":
+                # ask 路径：按工具类型分发不同的预览和确认 UI
+                if call.name in ("file_write", "file_edit"):
+                    # --- 文件编辑：安全校验已经做过；ask 模式只负责 diff + confirm ---
+                    if edit_preview is not None:
+                        path_str, old_content, new_content = edit_preview
+                        diff_text = render_diff(old_content, new_content, path_str)
+                        console.print(f"\n[bold]Diff for {path_str}:[/bold]")
+                        console.print(diff_text)
+                        if not confirm_edit(path_str):
+                            result = ToolResult(
+                                call.id, "error: edit rejected by user", is_error=True
+                            )
+                            emit(f"observation: {result.content}")
+                            messages.append(
+                                Message(
+                                    role="tool",
+                                    tool_call_id=result.tool_call_id,
+                                    content=result.content,
+                                    is_error=True,
+                                )
+                            )
+                            continue
+
+                elif call.name == "bash":
+                    # --- bash：命令预览 + confirm ---
+                    command = call.arguments.get("command", "")
+                    timeout = call.arguments.get("timeout", 30)
+                    console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
+                    console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
+                    if not confirm_command(command):
+                        result = ToolResult(
+                            call.id, "error: command rejected by user", is_error=True
+                        )
+                        emit(f"observation: {result.content}")
+                        messages.append(
+                            Message(
+                                role="tool",
+                                tool_call_id=result.tool_call_id,
+                                content=result.content,
+                                is_error=True,
+                            )
+                        )
+                        continue
+
+                elif call.name in ("web_fetch", "web_search"):
+                    # --- 网络工具：不写本地文件，但要让用户确认是否访问外部资源 ---
+                    detail = (
+                        call.arguments.get("url")
+                        or call.arguments.get("query")
+                        or str(call.arguments)
+                    )
+                    if not confirm_tool_use(call.name, detail):
+                        result = ToolResult(
+                            call.id, "error: tool use rejected by user", is_error=True
+                        )
+                        emit(f"observation: {result.content}")
+                        messages.append(
+                            Message(
+                                role="tool",
+                                tool_call_id=result.tool_call_id,
+                                content=result.content,
+                                is_error=True,
+                            )
+                        )
+                        continue
+
+                elif call.name == "ask_user_question":
+                    # v3 接上
+                    pass
+
+            # allow 路径 + ask 通过：执行工具
             result = tools.run(call, ctx)
             emit(f"observation: {result.content}")
             messages.append(

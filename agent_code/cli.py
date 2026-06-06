@@ -9,6 +9,7 @@ from .agent import run_agent
 from .llm_log import create_llm_logger
 from .model import AnthropicProvider
 from .tools import default_tools
+from typing import Literal
 
 console = Console()
 tool_registry = default_tools()
@@ -33,12 +34,17 @@ def handle_slash(line: str) -> bool:
     return False
 
 
-def run_once(prompt: str, cwd: Path, log_dir: Path | None) -> None:
+def run_once(
+    prompt: str,
+    cwd: Path,
+    log_dir: Path | None,
+    permission_mode: Literal["default", "acceptEdits", "plan"],
+) -> None:
     llm_logger = create_llm_logger(log_dir)
     if llm_logger:
         console.print(f"[dim]llm log: {llm_logger.path}[/dim]\n")
     provider = AnthropicProvider(llm_logger=llm_logger)
-    run_agent(prompt, provider, tool_registry, cwd=cwd)
+    run_agent(prompt, provider, tool_registry, cwd=cwd, permission_mode=permission_mode)
 
 
 def main_command(
@@ -50,6 +56,11 @@ def main_command(
         help="Directory for LLM request/response JSONL logs.",
         envvar="AGENT_CODE_LOG_DIR",
     ),
+    permission_mode: Literal["default", "acceptEdits", "plan"] = typer.Option(
+        "default",
+        "--permission-mode",
+        help="Permission mode: default, acceptEdits, plan",
+    ),
 ) -> None:
     # 启动时只解析一次cwd，让整个运行共享同一个工作目录
     resolved_cwd = cwd.resolve()
@@ -57,7 +68,7 @@ def main_command(
 
     if text:
         # 有prompt参数时进入一次性模式，运行一次就退出
-        run_once(text, resolved_cwd, log_dir)
+        run_once(text, resolved_cwd, log_dir, permission_mode)
         return
     # 注释1: REPL分支——命令后没跟prompt，走下面交互循环
     render_header(resolved_cwd)
@@ -71,7 +82,7 @@ def main_command(
             return
         if line.startswith("/") and handle_slash(line):
             continue
-        run_once(line, resolved_cwd, log_dir)
+        run_once(line, resolved_cwd, log_dir, permission_mode)
 
 
 def main() -> None:
