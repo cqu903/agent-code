@@ -133,6 +133,7 @@ def load_gitignore(cwd: Path) -> pathspec.PathSpec | None:
     lines = gitignore.read_text(encoding="utf-8", errors="replace").splitlines()
     return pathspec.PathSpec.from_lines("gitignore", lines)
 
+
 def ensure_read_before_edit(state: ReadFileState, path: Path) -> str | None:
     """检查文件是否在本次会话中被读过。没读过返回 error 字符串。"""
     if path not in state.entries:

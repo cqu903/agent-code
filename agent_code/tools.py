@@ -25,8 +25,9 @@ from .fs_safety import (
     resolve_in_cwd,
     should_skip,
     truncate_output,
-    apply_single_replace
+    apply_single_replace,
 )
+from .bash_runner import run_sync as _bash_run_sync
 
 
 @dataclass
@@ -440,6 +441,7 @@ def file_write(args: dict[str, Any], ctx: ToolContext) -> str:
     ctx.read_state.record(path, content)
     return f"Wrote {len(content)} chars to {path_str}"
 
+
 def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
     """字符串替换编辑。前置校验在 agent.py 拦截块里完成。"""
     path_str = args.get("file_path", "")
@@ -461,13 +463,40 @@ def file_edit(args: dict[str, Any], ctx: ToolContext) -> str:
 
     # 防 race：agent.py 已经做过一次 apply_single_replace 算 diff，
     # 如果 confirm 那一刻到现在 old_content 又被外部改过，这里会再兜一次。
-    new_content, err = apply_single_replace(content, old_string, new_string, replace_all)
+    new_content, err = apply_single_replace(
+        content, old_string, new_string, replace_all
+    )
     if err:
         return err
 
     path.write_text(new_content, encoding="utf-8")
     ctx.read_state.record(path, new_content)
     return f"Edited {path_str}: replaced {len(old_string)} chars with {len(new_string)} chars"
+
+
+def _git_status(args: dict[str, Any], ctx: ToolContext) -> str:
+    """薄包装 git status 只读，默认 allow"""
+    return _bash_run_sync("git status", ctx.cwd, timeout=10)
+
+
+def _git_diff(args: dict[str, Any], ctx: ToolContext) -> str:
+    """薄包装 git diff——只读、默认 allow。"""
+    return _bash_run_sync("git diff", ctx.cwd, timeout=10)
+
+
+def bash(args: dict[str, Any], ctx: ToolContext) -> str:
+    """执行 shell 命令，前置校验和用户确认在agent.py拦截块完成"""
+    command = args.get("command", "")
+    if not command:
+        return "error: missing required argument 'command'"
+    timeout = args.get("timeout", 30)
+    background = bool(args.get("background", False))
+
+    # v1只做同步，v4接background=True分支
+    if background:
+        return "error: background is not implemented yet."
+    return _bash_run_sync(command, ctx.cwd, timeout=timeout)
+
 
 class ToolRegistry:
     def __init__(self) -> None:
@@ -701,7 +730,10 @@ def default_tools() -> ToolRegistry:
             parameters={
                 "type": "object",
                 "properties": {
-                    "file_path": {"type": "string", "description": "Relative path inside cwd."},
+                    "file_path": {
+                        "type": "string",
+                        "description": "Relative path inside cwd.",
+                    },
                     "old_string": {
                         "type": "string",
                         "description": "Exact string to replace. Must match including whitespace and indentation.",
@@ -712,11 +744,58 @@ def default_tools() -> ToolRegistry:
                     },
                     "replace_all": {
                         "type": "boolean",
-                    "description": "Replace all occurrences. Default false.",
+                        "description": "Replace all occurrences. Default false.",
                         "default": False,
                     },
                 },
                 "required": ["file_path", "old_string", "new_string"],
+            },
+        )
+    )
+    registry.register(
+        Tool(
+            name="git_status",
+            description="Run git status to see the current state of the working directory.",
+            run=_git_status,
+            parameters={"type": "object", "properties": {}, "required": []},
+        )
+    )
+    registry.register(
+        Tool(
+            name="git_diff",
+            description="Run git diff to see unstaged changes in the working directory.",
+            run=_git_diff,
+            parameters={"type": "object", "properties": {}, "required": []},
+        )
+    )
+    registry.register(
+        Tool(
+            name="bash",
+            description=(
+                "Execute a shell command. Working directory persists but shell state "
+                "does not (each call is a fresh shell). timeout in seconds (default 30). "
+                "Avoid cd; use the tool's implicit cwd instead."
+            ),
+            run=bash,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds, default 30.",
+                        "default": 30,
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run in background. Returns immediately with a background_id. Default false.",
+                        "default": False,
+                    },
+                },
+                "required": ["command"],
             },
         )
     )
