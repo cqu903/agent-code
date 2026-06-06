@@ -93,9 +93,7 @@ def register_tool(
     description="Return the input text",
     parameters={
         "type": "object",
-        "properties": {
-            "text": {"type": "string", "description": "Text to return."}
-        },
+        "properties": {"text": {"type": "string", "description": "Text to return."}},
         "required": ["text"],
     },
 )
@@ -734,7 +732,17 @@ def bash(args: dict[str, Any], ctx: ToolContext) -> str:
 
     # v1只做同步，v4接background=True分支
     if background:
-        return "error: background is not implemented yet."
+        # 后台执行：启动子进程后立即返回结构化信息，不阻塞 Agent Loop
+        from .bg_manager import start_background
+
+        result = start_background(command, ctx.cwd)
+        return (
+            f"Command running in background with ID: {result['background_id']}.\n"
+            f"Output is being written to: {result['output_file']}\n"
+            f"Stderr is being written to: {result['stderr_file']}\n"
+            f"PID: {result['pid']}\n\n"
+            f"{result['message']}"
+        )
     return _bash_run_sync(command, ctx.cwd, timeout=timeout)
 
 
@@ -772,6 +780,45 @@ class ToolRegistry:
         for name in sorted(self._tools):
             tool = self._tools[name]
             out.print(f"  [cyan]{name}[/cyan] — {tool.description}")
+
+
+@register_tool(
+    name="ask_user_question",
+    description=(
+        "Ask the user a structured single-choice question. "
+        "Use when you need to decide between multiple approaches "
+        "or need user preference before proceeding."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The question to ask the user. Should end with ?.",
+            },
+            "options": {
+                "type": "array",
+                "description": "List of option labels (2-4 recommended).",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["prompt", "options"],
+    },
+)
+def _ask_user_question(args: dict[str, Any], ctx: ToolContext) -> str:
+    """由 agent.py 拦截块处理——工具函数本身不读 stdin。
+    拦截块识别 call.name == "ask_user_question"，调 prompt_ui 后把结果作为 observation 返回。"""
+    prompt = args.get("prompt", "")
+    options = args.get("options", [])
+    if not prompt:
+        return "error: missing required argument 'prompt'"
+    if not options or not isinstance(options, list):
+        return "error: options must be a non-empty list"
+    # 实际交互在 agent.py 拦截块里完成——这里只返回占位。
+    # 正常路径不会走到这里，因为拦截块会先处理。
+    return (
+        "error: ask_user_question must be handled by the harness, not executed directly"
+    )
 
 
 def default_tools() -> ToolRegistry:

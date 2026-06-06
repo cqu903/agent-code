@@ -16,7 +16,13 @@ from .fs_safety import (
     resolve_in_cwd,
 )
 from rich.console import Console
-from .prompt_ui import confirm_command, confirm_edit, confirm_tool_use, render_diff
+from .prompt_ui import (
+    confirm_command,
+    confirm_edit,
+    confirm_tool_use,
+    render_diff,
+    prompt_single_choice,
+)
 from .permissions import PermissionsRequest, decide_permission
 
 console = Console()
@@ -224,8 +230,30 @@ def run_agent(
                         continue
 
                 elif call.name == "ask_user_question":
-                    # v3 接上
-                    pass
+                    question = call.arguments.get("prompt", "")
+                    options = call.arguments.get("options", [])
+                    if not isinstance(options, list):
+                        options = []
+                    labels = [str(o) for o in options]
+                    selected = prompt_single_choice(question, labels)
+                    if selected is None:
+                        result = ToolResult(
+                            call.id, "User skipped the question.", is_error=False
+                        )
+                    else:
+                        result = ToolResult(
+                            call.id, f'User selected: "{selected}"', is_error=False
+                        )
+                    emit(f"observation: {result.content}")
+                    messages.append(
+                        Message(
+                            role="tool",
+                            tool_call_id=result.tool_call_id,
+                            content=result.content,
+                            is_error=result.is_error,
+                        )
+                    )
+                    continue
 
             # allow 路径 + ask 通过：执行工具
             result = tools.run(call, ctx)
