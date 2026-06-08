@@ -60,8 +60,11 @@ _READONLY_TOOLS = frozenset(
         "git_diff",
         "system_date",
         "echo",
+        "memory_recall",
     }
 )
+
+_LOW_RISK_WRITES = frozenset({"memory_write"})
 
 # 交互和网络都不是写入，但仍需要用户知道 Agent 正在停下来问人或访问外部资源。
 _ASK_TOOLS = frozenset({"ask_user_question", "web_fetch", "web_search"})
@@ -87,6 +90,10 @@ def decide_permission(request: PermissionsRequest) -> PermissionDecision:
         )
     # 只读工具在所有模式下默认允许
     if tool_name in _READONLY_TOOLS:
+        return PermissionDecision(behavior="allow")
+
+    # 低风险写工具在 default / acceptEdits自动放行
+    if tool_name in _LOW_RISK_WRITES:
         return PermissionDecision(behavior="allow")
 
     # bash 工具的危险命令检测--不管什么模式，危险命令先拦截

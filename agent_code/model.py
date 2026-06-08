@@ -22,7 +22,10 @@ class ModelResponse:
 
 class Provider(Protocol):
     def complete(
-        self, messages: list[Message], tools: list[Tool] | None = None
+        self,
+        messages: list[Message],
+        tools: list[Tool] | None = None,
+        system: str | None = None,
     ) -> ModelResponse: ...
 
 
@@ -135,7 +138,10 @@ class AnthropicProvider:
         return wire
 
     def complete(
-        self, messages: list[Message], tools: list[Tool] | None = None
+        self,
+        messages: list[Message],
+        tools: list[Tool] | None = None,
+        system: str | None = None,
     ) -> ModelResponse:
         wire_messages = self._to_wire_messages(messages)
         kwargs: dict[str, Any] = {
@@ -143,6 +149,8 @@ class AnthropicProvider:
             "max_tokens": self.max_tokens,
             "messages": wire_messages,
         }
+        if system:
+            kwargs["system"] = system
 
         if tools:
             kwargs["tools"] = self._to_anthropic_tools(tools)

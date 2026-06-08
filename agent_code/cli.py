@@ -11,6 +11,7 @@ from .model import AnthropicProvider
 from .tools import default_tools
 from typing import Literal
 from .session import Session
+from .agent import build_system_prompt
 
 console = Console()
 tool_registry = default_tools()
@@ -41,6 +42,7 @@ def run_once(
     log_dir: Path | None,
     permission_mode: Literal["default", "acceptEdits", "plan"],
     session: Session | None = None,
+    system_prompt: str | None = None,
 ) -> None:
     llm_logger = create_llm_logger(log_dir)
     if llm_logger:
@@ -56,6 +58,7 @@ def run_once(
         cwd=cwd,
         permission_mode=permission_mode,
         session=session,
+        system_prompt=system_prompt,
     )
 
 
@@ -95,11 +98,13 @@ def main_command(
             raise typer.Exit(code=1)
     text = prompt.strip()
 
+    system_prompt = build_system_prompt(resolved_cwd)
+
     if text:
         if session is None:
             session = Session.create(resolved_cwd)
         # 有prompt参数时进入一次性模式，运行一次就退出
-        run_once(text, resolved_cwd, log_dir, permission_mode, session)
+        run_once(text, resolved_cwd, log_dir, permission_mode, session, system_prompt)
         return
     # 注释1: REPL分支——命令后没跟prompt，走下面交互循环
     render_header(resolved_cwd)
@@ -116,7 +121,7 @@ def main_command(
             return
         if line.startswith("/") and handle_slash(line):
             continue
-        run_once(line, resolved_cwd, log_dir, permission_mode, session)
+        run_once(line, resolved_cwd, log_dir, permission_mode, session, system_prompt)
 
 
 def main() -> None:

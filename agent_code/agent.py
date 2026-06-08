@@ -25,6 +25,8 @@ from .prompt_ui import (
 )
 from .permissions import PermissionsRequest, decide_permission
 from .session import Session
+from .project_memory import load_agent_md
+from .compact_basic import compact
 
 console = Console()
 
@@ -36,6 +38,33 @@ class AgentResult:
     messages: list[Message]
 
 
+_SYSTEM_CORE = (
+    "You are an AI coding agent running inside a CLI harness. "
+    "You have access to tools for reading/writing files, running shell commands, "
+    "searching the web, and asking the user questions. "
+    "Use tools when needed; respond directly when you can."
+)
+
+
+def build_system_prompt(cwd: Path) -> str:
+    """
+    组装 system prompt：核心指南 + AGENT.md + MEMORY.md 索引。
+    注入顺序：core prompt → 项目规则 → 跨 session 记忆索引。
+    """
+    from .memdir.store import load_index as load_memory_index
+
+    parts: list[str] = [_SYSTEM_CORE]
+    agent_md = load_agent_md(cwd)
+    if agent_md:
+        parts.append(agent_md)
+
+    memory_index = load_memory_index(cwd)
+    if memory_index:
+        parts.append(f"<project-memory>\n{memory_index}\n</project-memory>")
+
+    return "\n\n".join(parts)
+
+
 def run_agent(
     prompt: str,
     provider: Provider,
@@ -44,6 +73,7 @@ def run_agent(
     cwd: Path | None = None,
     permission_mode: Literal["default", "acceptEdits", "plan"] = "default",
     session: Session | None = None,
+    system_prompt: str | None = None,
 ) -> AgentResult:
     resolved_cwd = cwd or Path.cwd()
     ctx = ToolContext(
@@ -76,7 +106,11 @@ def run_agent(
     trace: list[str] = []
 
     for _step in range(max_steps):
-        response = provider.complete(messages, tools=tools.list())
+        # 消息超过40条自动压缩
+        if len(messages) > 40:
+            messages = compact(messages, keep=8)
+            console.print(f"[dim]compacted: {len(messages)} messages remaining[/dim]")
+        response = provider.complete(messages, tools=tools.list(), system=system_prompt)
         messages.append(
             Message(
                 role="assistant",
