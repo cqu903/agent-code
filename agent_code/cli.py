@@ -10,6 +10,7 @@ from .llm_log import create_llm_logger
 from .model import AnthropicProvider
 from .tools import default_tools
 from typing import Literal
+from .session import Session
 
 console = Console()
 tool_registry = default_tools()
@@ -39,12 +40,23 @@ def run_once(
     cwd: Path,
     log_dir: Path | None,
     permission_mode: Literal["default", "acceptEdits", "plan"],
+    session: Session | None = None,
 ) -> None:
     llm_logger = create_llm_logger(log_dir)
     if llm_logger:
         console.print(f"[dim]llm log: {llm_logger.path}[/dim]\n")
+    if session:
+        suffix = " (resumed)" if session.resumed else ""
+        console.print(f"[dim]session: {session.session_id}{suffix}[/dim]")
     provider = AnthropicProvider(llm_logger=llm_logger)
-    run_agent(prompt, provider, tool_registry, cwd=cwd, permission_mode=permission_mode)
+    run_agent(
+        prompt,
+        provider,
+        tool_registry,
+        cwd=cwd,
+        permission_mode=permission_mode,
+        session=session,
+    )
 
 
 def main_command(
@@ -61,14 +73,33 @@ def main_command(
         "--permission-mode",
         help="Permission mode: default, acceptEdits, plan",
     ),
+    resume: str | None = typer.Option(
+        None, "--resume", help="按 session id 恢复指定会话"
+    ),
+    continue_: bool = typer.Option(
+        False, "--continue", "-c", help="回复 cwd 最近一次会话"
+    ),
 ) -> None:
     # 启动时只解析一次cwd，让整个运行共享同一个工作目录
     resolved_cwd = cwd.resolve()
+    session: Session | None = None
+    if continue_:
+        session = Session.load_latest(resolved_cwd)
+        if session is None:
+            console.print("[red]没有找到历史会话，无法 --continue。[/red]")
+            raise typer.Exit(code=1)
+    elif resume:
+        session = Session.load_id(resolved_cwd, resume)
+        if session is None:
+            console.print(f"[red]找不到 session: {resume}[/red]")
+            raise typer.Exit(code=1)
     text = prompt.strip()
 
     if text:
+        if session is None:
+            session = Session.create(resolved_cwd)
         # 有prompt参数时进入一次性模式，运行一次就退出
-        run_once(text, resolved_cwd, log_dir, permission_mode)
+        run_once(text, resolved_cwd, log_dir, permission_mode, session)
         return
     # 注释1: REPL分支——命令后没跟prompt，走下面交互循环
     render_header(resolved_cwd)

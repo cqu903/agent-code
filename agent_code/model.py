@@ -74,8 +74,8 @@ class AnthropicProvider:
 
     def _build_assistant_wire(self, message: Message) -> dict[str, Any]:
         content: list[dict[str, Any]] = []
-        if message.text:
-            content.append({"type": "text", "text": message.text})
+        if message.content:
+            content.append({"type": "text", "text": message.content})
         for call in message.tool_calls or []:
             content.append(
                 {
@@ -93,16 +93,21 @@ class AnthropicProvider:
         while index < len(messages):
             message = messages[index]
             if message.role == "user":
-                wire.append({"role": "user", "content": message.text or ""})
+                wire.append({"role": "user", "content": message.content or ""})
                 index += 1
                 continue
 
             if message.role == "assistant":
-                if message.provider_data and "content" in message.provider_data:
+                provider_data = message.provider_data
+                if (
+                    provider_data
+                    and provider_data.get("format", "anthropic") == "anthropic"
+                    and "content" in provider_data
+                ):
                     wire.append(
                         {
                             "role": "assistant",
-                            "content": message.provider_data["content"],
+                            "content": provider_data["content"],
                         }
                     )
                 else:
@@ -176,7 +181,11 @@ class AnthropicProvider:
                     )
                 )
 
-        provider_data = {"content": assistant_content} if assistant_content else None
+        provider_data = (
+            {"format": "anthropic", "content": assistant_content}
+            if assistant_content
+            else None
+        )
         return ModelResponse(
             text="\n".join(text_parts) or None,
             tool_calls=tool_calls or None,

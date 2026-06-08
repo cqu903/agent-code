@@ -24,6 +24,7 @@ from .prompt_ui import (
     prompt_single_choice,
 )
 from .permissions import PermissionsRequest, decide_permission
+from .session import Session
 
 console = Console()
 
@@ -42,6 +43,7 @@ def run_agent(
     max_steps: int = 99,
     cwd: Path | None = None,
     permission_mode: Literal["default", "acceptEdits", "plan"] = "default",
+    session: Session | None = None,
 ) -> AgentResult:
     resolved_cwd = cwd or Path.cwd()
     ctx = ToolContext(
@@ -54,7 +56,23 @@ def run_agent(
         trace.append(line)
         console.print(line)
 
-    messages: list[Message] = [Message(role="user", text=prompt)]
+    messages: list[Message] = []
+    # 如果有 session 且已有历史，从历史恢复；否则从当前prompt冷启动
+    if session and session.history:
+        messages = list(session.history)
+        messages.append(
+            Message(
+                role="user",
+                content=prompt,
+            )
+        )
+    else:
+        messages = [Message(role="user", content=prompt)]
+    # 刚加进 messages 的这条 user prompt 也要落盘，
+    # 否则 --resume 时 session.history 里只有 assistant 没有起点 user
+    if session:
+        session.append_messages([messages[-1]])
+
     trace: list[str] = []
 
     for _step in range(max_steps):
@@ -62,7 +80,7 @@ def run_agent(
         messages.append(
             Message(
                 role="assistant",
-                text=response.text,
+                content=response.text,
                 tool_calls=response.tool_calls,
                 provider_data=response.provider_data,
             )
@@ -71,6 +89,9 @@ def run_agent(
         if not response.tool_calls:
             final = response.text or ""
             emit(f"final: {final}")
+            # 把最终 assistant 消息落盘
+            if session:
+                session.append_messages([messages[-1]])
             return AgentResult(final=final, trace=trace, messages=messages)
 
         for call in response.tool_calls:
@@ -266,6 +287,8 @@ def run_agent(
                     is_error=result.is_error,
                 )
             )
+            if session:
+                session.append_messages(messages[-2:])
 
     final = f"reached max_steps={max_steps}"
     emit(f"final: {final}")
