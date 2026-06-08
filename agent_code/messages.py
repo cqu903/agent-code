@@ -8,6 +8,23 @@ from .tools import ToolCall
 ProviderFormat = Literal["anthropic", "openai"]
 
 
+def sanitize_text(text: str) -> str:
+    """Remove lone UTF-16 surrogates that break JSON / UTF-8 serialization."""
+    return "".join(
+        "\ufffd" if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text
+    )
+
+
+def sanitize_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, dict):
+        return {k: sanitize_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_value(item) for item in value]
+    return value
+
+
 @dataclass
 class Message:
     role: Literal["user", "assistant", "tool"]
@@ -27,7 +44,7 @@ def message_to_record(msg: Message) -> dict[str, Any]:
     """
     record: dict[str, Any] = {"role": msg.role}
     if msg.content is not None:
-        record["content"] = msg.content
+        record["content"] = sanitize_text(msg.content)
     if msg.tool_calls:
         record["tool_calls"] = [
             {"id": call.id, "name": call.name, "arguments": call.arguments}
@@ -38,7 +55,7 @@ def message_to_record(msg: Message) -> dict[str, Any]:
     if msg.is_error:
         record["is_error"] = True
     if msg.provider_data is not None:
-        record["provider_data"] = msg.provider_data
+        record["provider_data"] = sanitize_value(msg.provider_data)
     return record
 
 
@@ -69,10 +86,16 @@ def message_from_record(data: dict[str, Any]) -> Message | None:
     provider_data = data.get("provider_data")
     if provider_data is not None and not isinstance(provider_data, dict):
         provider_data = None
+    elif provider_data is not None:
+        provider_data = sanitize_value(provider_data)
+
+    content = data.get("content")
+    if isinstance(content, str):
+        content = sanitize_text(content)
 
     return Message(
         role=role,
-        content=data.get("content"),
+        content=content,
         tool_calls=tool_calls,
         tool_call_id=data.get("tool_call_id"),
         is_error=bool(data.get("is_error", False)),

@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from anthropic import Anthropic
 
 from .llm_log import LLMLogger
-from .messages import Message
+from .messages import Message, sanitize_value
 from .tools import Tool, ToolCall
 
 
@@ -146,6 +146,8 @@ class AnthropicProvider:
 
         if tools:
             kwargs["tools"] = self._to_anthropic_tools(tools)
+
+        kwargs = sanitize_value(kwargs)
 
         turn = 0
         if self.llm_logger:

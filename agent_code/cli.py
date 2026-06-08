@@ -103,6 +103,9 @@ def main_command(
         return
     # 注释1: REPL分支——命令后没跟prompt，走下面交互循环
     render_header(resolved_cwd)
+    if session:
+        suffix = " (resumed)" if session.resumed else ""
+        console.print(f"[dim]session: {session.session_id}{suffix}[/dim]")
     console.print("输入 /help 查看命令，输入 /exit 退出。")
     while True:
         line = console.input("[bold]>[/bold] ").strip()
@@ -113,7 +116,7 @@ def main_command(
             return
         if line.startswith("/") and handle_slash(line):
             continue
-        run_once(line, resolved_cwd, log_dir, permission_mode)
+        run_once(line, resolved_cwd, log_dir, permission_mode, session)
 
 
 def main() -> None:
