@@ -49,3 +49,33 @@ class SlashCommand:
     name: str
     description: str  # /help 列出时显示
     handler: SlashHandler  # 实际执行函数
+
+
+# 全局注册表：模块加载后所有内置命令都注册在这里
+_registry: dict[str, SlashCommand] = {}
+
+
+def register(name: str, description: str, handler: SlashHandler) -> None:
+    """注册一条 slash command。name 不要 / 前缀"""
+    _registry[name] = SlashCommand(name=name, description=description, handler=handler)
+
+
+def dispatch_splash(line: str, ctx: SlashContext) -> SlashResult:
+    """
+    解析 "/name args" 并分派到已注册mingling，未匹配时返回 handled=False。
+    """
+    if not line.startswith("/"):
+        return SlashResult(handled=False)
+    # 去掉首字符 /，用 shlex 拆 command name 和 args，这样 --label “PR 状态轮询” 能保留空格
+    try:
+        parts = shlex.split(line[1:].strip())
+    except ValueError as exc:
+        return SlashResult(handled=False, message=f"Invalid command syntax: {exc}")
+    if not parts:
+        return SlashResult(handled=False)
+    name = parts[0]
+    args = parts[1:]
+    cmd = _registry.get(name)
+    if cmd is None:
+        return SlashResult(handled=True, message=f"Unknown command: {name}")
+    return cmd.handler(args, ctx)
