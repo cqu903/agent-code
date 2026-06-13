@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlparse
 
 import typer
 from dotenv import load_dotenv
@@ -12,6 +13,7 @@ from .tools import default_tools
 from typing import Literal
 from .session import Session
 from .agent import build_system_prompt
+from .slash import SlashContext, dispatch_slash
 
 console = Console()
 tool_registry = default_tools()
@@ -29,32 +31,29 @@ def render_header(cwd: Path):
     console.print(f"[dim]cwd: {cwd}[/dim]\n")
 
 
-def handle_slash(line: str) -> bool:
-    if line == "/help":
-        tool_registry.print_help(console)
-        return True
-    return False
+def _provider_name(base_url: str) -> str:
+    host = urlparse(base_url).hostname or "unknown"
+    parts = host.split(".")
+    return parts[-2] if len(parts) >= 2 else host
 
 
 def run_once(
     prompt: str,
     cwd: Path,
-    log_dir: Path | None,
+    provider: AnthropicProvider,
+    max_steps: int,
     permission_mode: Literal["default", "acceptEdits", "plan"],
     session: Session | None = None,
     system_prompt: str | None = None,
 ) -> None:
-    llm_logger = create_llm_logger(log_dir)
-    if llm_logger:
-        console.print(f"[dim]llm log: {llm_logger.path}[/dim]\n")
     if session:
         suffix = " (resumed)" if session.resumed else ""
         console.print(f"[dim]session: {session.session_id}{suffix}[/dim]")
-    provider = AnthropicProvider(llm_logger=llm_logger)
     run_agent(
         prompt,
         provider,
         tool_registry,
+        max_steps=max_steps,
         cwd=cwd,
         permission_mode=permission_mode,
         session=session,
@@ -75,6 +74,15 @@ def main_command(
         "default",
         "--permission-mode",
         help="Permission mode: default, acceptEdits, plan",
+    ),
+    model: str = typer.Option(
+        "glm-5.1", "--model", "-m", help="Model name."
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="API base URL override."
+    ),
+    max_steps: int = typer.Option(
+        99, "--max-steps", help="Max agent loop steps."
     ),
     resume: str | None = typer.Option(
         None, "--resume", help="按 session id 恢复指定会话"
@@ -98,13 +106,61 @@ def main_command(
             raise typer.Exit(code=1)
     text = prompt.strip()
 
+    llm_logger = create_llm_logger(log_dir)
+    if llm_logger:
+        console.print(f"[dim]llm log: {llm_logger.path}[/dim]\n")
+    provider = AnthropicProvider(
+        model=model, base_url=base_url, llm_logger=llm_logger
+    )
+    provider_name = _provider_name(provider.base_url)
     system_prompt = build_system_prompt(resolved_cwd)
 
-    if text:
+    def run_user_input(line: str) -> None:
+        """
+        统一处理用户输入：先走 slash dispatch，未命中再进入 Agent Loop。
+        REPL 用户输入和 cron pending prompt 都必须走这个入口。
+        """
+        nonlocal session
+        slash_result = dispatch_slash(
+            line,
+            SlashContext(
+                cwd=resolved_cwd,
+                permission_mode=permission_mode,
+                model=model,
+                provider=provider_name,
+                session_id=session.session_id if session else None,
+            ),
+        )
+        if slash_result.handled:
+            if slash_result.message:
+                console.print(slash_result.message)
+            if slash_result.should_query:
+                if session is None:
+                    session = Session.create(resolved_cwd)
+                run_once(
+                    slash_result.prompt,
+                    resolved_cwd,
+                    provider,
+                    max_steps,
+                    permission_mode,
+                    session=session,
+                    system_prompt=system_prompt,
+                )
+            return
         if session is None:
             session = Session.create(resolved_cwd)
-        # 有prompt参数时进入一次性模式，运行一次就退出
-        run_once(text, resolved_cwd, log_dir, permission_mode, session, system_prompt)
+        run_once(
+            line,
+            resolved_cwd,
+            provider,
+            max_steps,
+            permission_mode,
+            session=session,
+            system_prompt=system_prompt,
+        )
+
+    if text:
+        run_user_input(text.strip())
         return
     # 注释1: REPL分支——命令后没跟prompt，走下面交互循环
     render_header(resolved_cwd)
@@ -119,9 +175,7 @@ def main_command(
         if line == "/exit":
             console.print("Bye.")
             return
-        if line.startswith("/") and handle_slash(line):
-            continue
-        run_once(line, resolved_cwd, log_dir, permission_mode, session, system_prompt)
+        run_user_input(line)
 
 
 def main() -> None:
