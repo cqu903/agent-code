@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agent_code.agent import run_agent
 from agent_code.model import ModelResponse
+from agent_code.runtime import RuntimeState
 from agent_code.tools import ToolCall, default_tools
 
 
@@ -66,7 +67,7 @@ def test_file_edit_writes_disk_in_accept_edits(tmp_path: Path) -> None:
         provider=provider,
         tools=default_tools(),
         cwd=tmp_path,
-        permission_mode="acceptEdits",
+        state=RuntimeState(permission_mode="acceptEdits"),
     )
 
     # 4. 断言文件确实被改写——bug 存在时这行会失败

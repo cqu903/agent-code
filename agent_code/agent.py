@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from .messages import Message
 from .model import Provider, ModelResponse
+from .runtime import RuntimeState
 from .tools import ToolRegistry, ToolContext, ToolResult
 from .fs_safety import (
     SkipPolicy,
@@ -72,20 +72,25 @@ def run_agent(
     tools: ToolRegistry,
     max_steps: int = 99,
     cwd: Path | None = None,
-    permission_mode: Literal["default", "acceptEdits", "plan"] = "default",
+    state: RuntimeState | None = None,
     session: Session | None = None,
     system_prompt: str | None = None,
 ) -> AgentResult:
     resolved_cwd = cwd or Path.cwd()
+    state = state or RuntimeState()
     ctx = ToolContext(
         cwd=resolved_cwd,
         skip_policy=SkipPolicy.default(gitignore=load_gitignore(resolved_cwd)),
+        runtime_state=state,
     )
 
     def emit(line: str) -> None:
         # 流式输出trace： append给测试用
         trace.append(line)
-        console.print(line, markup=False)
+        # highlight=False：emit 打印的是模型文本/工具结果（含代码片段），
+        # 默认 highlight=True 会在 TTY 下给 "func(" 之类套 ANSI 高亮码，
+        # 经 patch_stdout 后 ESC 泄漏成可见的 '?'。关掉它，原样输出。
+        console.print(line, markup=False, highlight=False)
 
     messages: list[Message] = []
     # 如果有 session 且已有历史，从历史恢复；否则从当前prompt冷启动
@@ -136,7 +141,7 @@ def run_agent(
             request = PermissionsRequest(
                 tool_name=call.name,
                 args=call.arguments,
-                mode=permission_mode,
+                mode=state.permission_mode,
                 cwd=ctx.cwd,
             )
             decision = decide_permission(request)
@@ -154,7 +159,7 @@ def run_agent(
                     messages.append(
                         Message(
                             role="tool",
-                            tool_call_id=call.tool_call_id,
+                            tool_call_id=call.id,
                             content=observation,
                             is_error=True,
                         )
@@ -175,7 +180,7 @@ def run_agent(
                     messages.append(
                         Message(
                             role="tool",
-                            tool_call_id=call.tool_call_id,
+                            tool_call_id=call.id,
                             content=result.content,
                             is_error=True,
                         )

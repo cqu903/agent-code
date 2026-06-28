@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {"matcher": "file_edit", "run": "python3 -c \"import json,pathlib,sys; d=json.load(sys.stdin); pathlib.Path('hook.log').write_text('post '+d['tool_name'])\""}
+    ]
+  }
+}

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from anthropic import Anthropic
 
-from .llm_log import LLMLogger
 from .messages import Message, sanitize_value
 from .tools import Tool, ToolCall
 
@@ -35,7 +33,6 @@ class AnthropicProvider:
         model: str = "glm-5.2",
         max_tokens: int = 8192,
         base_url: str | None = None,
-        llm_logger: LLMLogger | None = None,
     ) -> None:
         api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN")
         if not api_key:
@@ -48,7 +45,6 @@ class AnthropicProvider:
             "ANTHROPIC_BASE_URL",
             "https://api.deepseek.com/anthropic",
         )
-        self.llm_logger = llm_logger
         self.client = Anthropic(api_key=api_key, base_url=self.base_url)
 
     def _to_anthropic_tools(self, tools: list[Tool]) -> list[dict[str, Any]]:
@@ -157,21 +153,7 @@ class AnthropicProvider:
 
         kwargs = sanitize_value(kwargs)
 
-        turn = 0
-        if self.llm_logger:
-            turn = self.llm_logger.next_turn()
-            self.llm_logger.log_request(turn, kwargs)
-
-        started = time.monotonic()
         response = self.client.messages.create(**kwargs)
-        duration_ms = int((time.monotonic() - started) * 1000)
-
-        if self.llm_logger:
-            self.llm_logger.log_response(
-                turn,
-                response.model_dump(exclude_none=True),
-                duration_ms=duration_ms,
-            )
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []

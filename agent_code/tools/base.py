@@ -13,6 +13,7 @@ from typing import Any, Callable
 from rich.console import Console
 
 from ..fs_safety import ReadFileState, SkipPolicy
+from ..runtime import RuntimeState
 
 
 @dataclass
@@ -21,6 +22,7 @@ class ToolContext:
     cwd: Path
     skip_policy: SkipPolicy = field(default_factory=SkipPolicy.default)
     read_state: ReadFileState = field(default_factory=ReadFileState)
+    runtime_state: RuntimeState | None = None
 
 
 ToolFunc = Callable[[dict[str, Any], ToolContext], str]
