@@ -61,6 +61,7 @@ _READONLY_TOOLS = frozenset(
         "system_date",
         "echo",
         "memory_recall",
+        "corn_list",
     }
 )
 

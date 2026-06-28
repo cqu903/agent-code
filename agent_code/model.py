@@ -32,7 +32,7 @@ class Provider(Protocol):
 class AnthropicProvider:
     def __init__(
         self,
-        model: str = "glm-5.1",
+        model: str = "glm-5.2",
         max_tokens: int = 8192,
         base_url: str | None = None,
         llm_logger: LLMLogger | None = None,

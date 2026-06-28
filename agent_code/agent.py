@@ -27,6 +27,7 @@ from .permissions import PermissionsRequest, decide_permission
 from .session import Session
 from .project_memory import load_agent_md
 from .compact_basic import compact
+from .hooks import run_hooks
 
 console = Console()
 
@@ -84,7 +85,7 @@ def run_agent(
     def emit(line: str) -> None:
         # 流式输出trace： append给测试用
         trace.append(line)
-        console.print(line)
+        console.print(line, markup=False)
 
     messages: list[Message] = []
     # 如果有 session 且已有历史，从历史恢复；否则从当前prompt冷启动
@@ -140,14 +141,66 @@ def run_agent(
             )
             decision = decide_permission(request)
 
+            # plan模式等deny决策已经在上面算出，deny不再执行本地hook，避免hook副作用
+            if decision.behavior != "deny":
+                pre_hooks = run_hooks("PreToolUse", call.name, call.arguments, ctx.cwd)
+                pre_blocked = [h for h in pre_hooks if not h["success"]]
+                if pre_blocked:
+                    blocked_msgs = "\n".join(
+                        f" [hook] {h['command']}: {h['output']}" for h in pre_blocked
+                    )
+                    observation = f"tool blocked by PreToolUse hook:\n{blocked_msgs}"
+                    emit(f"observation: {observation}")
+                    messages.append(
+                        Message(
+                            role="tool",
+                            tool_call_id=call.tool_call_id,
+                            content=observation,
+                            is_error=True,
+                        )
+                    )
+                    continue
+
             edit_preview: tuple[str, str, str] | None = None
             if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
                 # acceptEdits 只跳过确认 UI，不能跳过 Day 4 的安全校验
                 path_str = call.arguments.get("file_path", "")
+                if not path_str:
+                    result = ToolResult(
+                        call.id,
+                        "error: missing required argument 'file_path'",
+                        is_error=True,
+                    )
+                    emit(f"observation: {result.content}")
+                    messages.append(
+                        Message(
+                            role="tool",
+                            tool_call_id=call.tool_call_id,
+                            content=result.content,
+                            is_error=True,
+                        )
+                    )
+                    continue
                 try:
                     path = resolve_in_cwd(ctx.cwd, path_str)
                 except (ValueError, OSError) as exc:
                     result = ToolResult(call.id, f"error: {exc}", is_error=True)
+                    emit(f"observation: {result.content}")
+                    messages.append(
+                        Message(
+                            role="tool",
+                            tool_call_id=result.tool_call_id,
+                            content=result.content,
+                            is_error=True,
+                        )
+                    )
+                    continue
+                if path.is_dir():
+                    result = ToolResult(
+                        call.id,
+                        f"error: path is a directory: {path_str}",
+                        is_error=True,
+                    )
                     emit(f"observation: {result.content}")
                     messages.append(
                         Message(
@@ -313,6 +366,19 @@ def run_agent(
             # allow 路径 + ask 通过：执行工具
             result = tools.run(call, ctx)
             emit(f"observation: {result.content}")
+
+            # PostToolUse hooks - 在工具执行成功后运行，失败不阻断
+            if not result.is_error:
+                post_hooks = run_hooks(
+                    "PostToolUse",
+                    call.name,
+                    call.arguments,
+                    ctx.cwd,
+                    tool_result=result.content,
+                )
+                for h in post_hooks:
+                    status = "ok" if h["success"] else f"warning: {h['output']}"
+                    console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
             messages.append(
                 Message(
                     role="tool",

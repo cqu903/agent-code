@@ -762,7 +762,10 @@ def bash(args: dict[str, Any], ctx: ToolContext) -> str:
                 "description": "Memory category.",
             },
             "title": {"type": "string", "description": "Short title for this memory."},
-            "body": {"type": "string", "description": "Full markdown content of the memory."},
+            "body": {
+                "type": "string",
+                "description": "Full markdown content of the memory.",
+            },
         },
         "required": ["type", "title", "body"],
     },
@@ -906,6 +909,11 @@ def _ask_user_question(args: dict[str, Any], ctx: ToolContext) -> str:
 
 
 def default_tools() -> ToolRegistry:
+    # 延迟导入 cron_tools：触发它的 @register_tool，把 cron_* 并入 _REGISTERED_TOOLS。
+    # 放函数内而非文件顶部，是为了等本模块加载完毕——cron_tools 反向 import tools
+    # 里的 register_tool/ToolContext，顶部导入会形成循环。这是 Python 打破循环依赖的惯用法。
+    from . import cron_tools  # noqa: F401
+
     registry = ToolRegistry()
     for tool in _REGISTERED_TOOLS:
         registry.register(tool)
