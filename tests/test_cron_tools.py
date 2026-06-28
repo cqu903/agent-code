@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import agent_code.cron_tools as cron_tools
+import agent_code.tools.cron as cron_tools
 from agent_code.tools import ToolContext, default_tools
 
 
@@ -20,7 +20,7 @@ def _ctx(tmp_path: Path) -> ToolContext:
 
 
 def test_cron_tools_registered() -> None:
-    # @register_tool 装饰 + tools.py 末尾导入 cron_tools，三者应自动出现在默认注册表
+    # @register_tool 装饰 + tools/__init__.py 顶部 import cron，三者应自动出现在默认注册表
     names = {t.name for t in default_tools().list()}
     assert {"cron_create", "cron_list", "cron_cancel"} <= names
 

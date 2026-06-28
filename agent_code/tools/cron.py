@@ -1,11 +1,13 @@
+"""cron 工具：cron_create、cron_list、cron_cancel + scheduler 接线。"""
+
 from __future__ import annotations
 
 from typing import Any
 
-from .scheduler import CronScheduler
-from .tools import ToolContext, register_tool
+from .base import ToolContext, register_tool
+from ..scheduler import CronScheduler
 
-# 全局 scheduler 单例--由 cli.py 在启动 REPL 时设置
+# 全局 scheduler 单例——由 cli.py 在启动 REPL 时设置
 _scheduler: Any = None
 
 
@@ -19,8 +21,6 @@ def _get_scheduler(ctx: ToolContext) -> CronScheduler:
     """REPL 里复用正在运行的 scheduler；一次性模式临时读写 cron.json。"""
     if _scheduler is not None:
         return _scheduler
-    from .scheduler import CronScheduler
-
     return CronScheduler(ctx.cwd)
 
 
