@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,6 +15,10 @@ from typing import Literal
 from .session import Session
 from .agent import build_system_prompt
 from .slash import SlashContext, dispatch_slash
+import threading
+from queue import Empty, Queue
+from .scheduler import CronScheduler
+from .tools.cron import set_scheduler
 
 console = Console()
 tool_registry = default_tools()
@@ -75,15 +80,11 @@ def main_command(
         "--permission-mode",
         help="Permission mode: default, acceptEdits, plan",
     ),
-    model: str = typer.Option(
-        "glm-5.1", "--model", "-m", help="Model name."
-    ),
+    model: str = typer.Option("glm-5.1", "--model", "-m", help="Model name."),
     base_url: str | None = typer.Option(
         None, "--base-url", help="API base URL override."
     ),
-    max_steps: int = typer.Option(
-        99, "--max-steps", help="Max agent loop steps."
-    ),
+    max_steps: int = typer.Option(99, "--max-steps", help="Max agent loop steps."),
     resume: str | None = typer.Option(
         None, "--resume", help="按 session id 恢复指定会话"
     ),
@@ -109,9 +110,7 @@ def main_command(
     llm_logger = create_llm_logger(log_dir)
     if llm_logger:
         console.print(f"[dim]llm log: {llm_logger.path}[/dim]\n")
-    provider = AnthropicProvider(
-        model=model, base_url=base_url, llm_logger=llm_logger
-    )
+    provider = AnthropicProvider(model=model, base_url=base_url, llm_logger=llm_logger)
     provider_name = _provider_name(provider.base_url)
     system_prompt = build_system_prompt(resolved_cwd)
 
@@ -149,6 +148,7 @@ def main_command(
             return
         if session is None:
             session = Session.create(resolved_cwd)
+
         run_once(
             line,
             resolved_cwd,
@@ -164,18 +164,74 @@ def main_command(
         return
     # 注释1: REPL分支——命令后没跟prompt，走下面交互循环
     render_header(resolved_cwd)
+
+    # 启动scheduler
+    scheduler = CronScheduler(resolved_cwd)
+    set_scheduler(scheduler)
+    scheduler.start()
+
     if session:
         suffix = " (resumed)" if session.resumed else ""
         console.print(f"[dim]session: {session.session_id}{suffix}[/dim]")
     console.print("输入 /help 查看命令，输入 /exit 退出。")
-    while True:
-        line = console.input("[bold]>[/bold] ").strip()
-        if not line:
-            continue
-        if line == "/exit":
-            console.print("Bye.")
-            return
-        run_user_input(line)
+
+    # 输入线程只负责把用户输入放进队列，不打印提示符；
+    # 提示符由主线程在“准备好接收下一条输入”时打印，避免它和命令输出
+    # 在两条线程里交错后拼到同一行，导致输出结束后看不到 ">"。
+    input_queue: Queue[str | None] = Queue()
+    stop_repl = threading.Event()
+
+    def _read_input() -> None:
+        while not stop_repl.is_set():
+            try:
+                raw = sys.stdin.readline()
+            except KeyboardInterrupt:
+                input_queue.put(None)
+                return
+            if raw == "":  # EOF (Ctrl+D)
+                input_queue.put(None)
+                return
+            input_queue.put(raw.strip())
+
+    input_thread = threading.Thread(target=_read_input, daemon=True)
+    input_thread.start()
+
+    def _show_prompt() -> None:
+        print("> ", end="", flush=True)
+
+    try:
+        while True:
+            _show_prompt()
+            # 等待用户输入的同时，主线程定期检查 cron pending queue；
+            # 内层循环在拿到一行输入前持续轮询，保证空闲时 cron 也能触发。
+            while True:
+                for pp in scheduler.drain_pending():
+                    # cron 输出前先换行离开提示符所在行，输出后再重新打印提示符，
+                    # 否则会和 ">" 拼在同一行。
+                    print(flush=True)
+                    console.print(f"[dim]cron: running scheduled job → {pp}[/dim]")
+                    run_user_input(pp)
+                    _show_prompt()
+                try:
+                    line = input_queue.get(timeout=0.5)
+                    break
+                except Empty:
+                    continue
+
+            if line is None:
+                print(flush=True)  # 离开提示符行再退出
+                break
+            if not line:
+                continue  # 空行：回到循环顶部重新打印提示符
+            if line == "/exit":
+                print(flush=True)
+                console.print("Bye.")
+                break
+            # 用户按下回车后终端已把光标移到新行，命令输出自然落在新行。
+            run_user_input(line)
+    finally:
+        stop_repl.set()
+        scheduler.stop()
 
 
 def main() -> None:
