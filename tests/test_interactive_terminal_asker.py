@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
+import sys
 import threading
 import time
 
@@ -135,6 +137,59 @@ def test_run_on_main_terminal_keeps_main_loop_responsive() -> None:
         assert (
             box["delta"] >= 3
         ), f"主循环在 func 阻塞期间被冻结：仅 {box['delta']} 个心跳（期望 >=3）"
+    finally:
+        stop.set()
+        mt.join(timeout=2)
+
+
+def test_run_on_main_terminal_writes_to_real_stdout_not_patch_stdout_proxy(
+    monkeypatch,
+) -> None:
+    """fix：cross-thread 确认 func 的输出必须直写真实终端，绕过 patch_stdout 代理。
+
+    根因（实跑复现）：patch_stdout 的 flush 线程靠 run_in_terminal(write_and_flush)
+    把输出排到输入框上方，而 run_in_terminal 要排队等当前 in_terminal 释放。
+    cross-thread 确认（typer.confirm）正好占着 in_terminal 阻塞读 stdin——于是
+    确认提示（无换行符的 "Run this command? [y/N]:"）被代理缓冲、flush 线程又被
+    挡，用户按回车前根本看不见，REPL 表现为"卡死，按一下回车才继续"。
+
+    修法：run_on_main_terminal 在 in_terminal 里把 sys.stdout 临时指回真实终端
+    （patch_stdout 接管前的原 stdout，= sys.__stdout__），func 直写、立即可见。
+    in_terminal 已擦除输入框并关闭渲染，此刻直写真实终端是安全的。
+    """
+    real = io.StringIO()  # 真实终端替身
+    proxy = io.StringIO()  # patch_stdout 代理替身（会缓冲）
+    monkeypatch.setattr(sys, "stdout", proxy)
+    monkeypatch.setattr(sys, "__stdout__", real)
+
+    box, mt, stop = _start_main_loop()
+    try:
+        captured: dict = {}
+
+        def worker() -> None:
+            def func() -> bool:
+                # 模拟 typer.confirm 的无换行提示
+                print("Run this command? [y/N]:", end="")
+                return True
+
+            try:
+                captured["v"] = run_on_main_terminal(func, box["loop"])
+            except Exception as exc:  # noqa: BLE001
+                captured["err"] = repr(exc)
+
+        wt = threading.Thread(target=worker, name="worker_loop")
+        wt.start()
+        wt.join()
+
+        assert "err" not in captured, captured.get("err")
+        assert captured["v"] is True
+        # 关键不变量：func 输出走真实终端，不进 patch_stdout 代理
+        assert "Run this command?" in real.getvalue(), (
+            "func 输出应直写真实终端（用户才看得见确认）"
+        )
+        assert "Run this command?" not in proxy.getvalue(), (
+            "func 输出不应进 patch_stdout 代理（会被缓冲/被 in_terminal 挡住）"
+        )
     finally:
         stop.set()
         mt.join(timeout=2)

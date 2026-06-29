@@ -336,12 +336,12 @@ def run_agent(
                 # ask 路径：按工具类型分发不同的预览和确认 UI
                 if call.name in ("file_write", "file_edit"):
                     # --- 文件编辑：安全校验已经做过；ask 模式只负责 diff + confirm ---
+                    # diff 预览放进 confirm_edit 内部打印（和 bash 同理：预览要和确认
+                    # 问题一起在 in_terminal 里直写真实终端，否则卡在 patch_stdout）。
                     if edit_preview is not None:
                         path_str, old_content, new_content = edit_preview
                         diff_text = render_diff(old_content, new_content, path_str)
-                        console.print(f"\n[bold]Diff for {path_str}:[/bold]")
-                        console.print(diff_text)
-                        if not confirm_edit(path_str):
+                        if not confirm_edit(path_str, diff_text=diff_text):
                             result = ToolResult(
                                 call.id, "error: edit rejected by user", is_error=True
                             )
@@ -358,11 +358,12 @@ def run_agent(
 
                 elif call.name == "bash":
                     # --- bash：命令预览 + confirm ---
+                    # 预览（Command: / timeout）放进 confirm_command 内部打印，和确认
+                    # 问题一起经 run_on_main_terminal → in_terminal 直写真实终端，
+                    # 避免预览卡在 patch_stdout 代理里、排到用户回答之后才出现。
                     command = call.arguments.get("command", "")
                     timeout = call.arguments.get("timeout", 30)
-                    console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
-                    console.print(f"[dim]timeout: {timeout}s  cwd: {ctx.cwd}[/dim]")
-                    if not confirm_command(command):
+                    if not confirm_command(command, timeout=timeout, cwd=ctx.cwd):
                         result = ToolResult(
                             call.id, "error: command rejected by user", is_error=True
                         )

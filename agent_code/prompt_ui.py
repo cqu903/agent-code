@@ -1,8 +1,17 @@
 from __future__ import annotations
 import difflib
 import typer
+from pathlib import Path
+from rich.console import Console
 
 _terminal_asker = None
+
+# 确认对话框的预览（Command: / Diff for …）用这个 console 打印。关键：预览必须和
+# 确认问题一起在 _ask 的 func 里打印——在 REPL 里 func 经 run_on_main_terminal
+# 调度到主线程 in_terminal 内、且 sys.stdout 被临时指回真实终端直写（见
+# interactive.run_on_main_terminal）。若预览由 worker 线程单独 console.print，
+# 会进 patch_stdout 代理，被 in_terminal 挡住，排到用户回答确认之后才出现。
+console = Console()
 
 
 def set_terminal_asker(asker) -> None:
@@ -44,12 +53,30 @@ def render_diff(old: str, new: str, path: str) -> str:
     return "\n".join(colored)
 
 
-def confirm_edit(path: str) -> bool:
-    return _ask(lambda: typer.confirm(f"Apply this edit to {path}?", default=False))
+def confirm_edit(path: str, diff_text: str = "") -> bool:
+    """文件编辑确认。diff 预览和确认问题都在 func 里打印（见模块 console 注释），
+    一起进 run_on_main_terminal → in_terminal 直写真实终端，保证预览在问题之前、
+    即时可见。"""
+
+    def _do() -> bool:
+        if diff_text:
+            console.print(f"\n[bold]Diff for {path}:[/bold]")
+            console.print(diff_text)
+        return typer.confirm(f"Apply this edit to {path}?", default=False)
+
+    return _ask(_do)
 
 
-def confirm_command(command: str) -> bool:
-    return _ask(lambda: typer.confirm("Run this command?", default=False))
+def confirm_command(command: str, timeout: int = 30, cwd: Path | None = None) -> bool:
+    """bash 命令确认。命令预览（Command: / timeout）和确认问题都在 func 里打印
+    （见模块 console 注释），一起进 run_on_main_terminal → in_terminal 直写。"""
+
+    def _do() -> bool:
+        console.print(f"\n[bold yellow]Command:[/bold yellow] {command}")
+        console.print(f"[dim]timeout: {timeout}s  cwd: {cwd}[/dim]")
+        return typer.confirm("Run this command?", default=False)
+
+    return _ask(_do)
 
 
 def confirm_tool_use(tool_name: str, detail: str) -> bool:
@@ -60,10 +87,8 @@ def prompt_single_choice(question: str, labels: list[str]) -> str | None:
     """展示一个 number menu 让用户单选，返回被选中的label。
     渲染 + 读 stdin 都走 _ask —— REPL 模式下整块调度到主线程 run_in_terminal，
     避免和 prompt_toolkit 抢 stdin；one-shot 直接跑。"""
-    from rich.console import Console
 
     def _do() -> str | None:
-        console = Console()
         console.print(f"\n[bold yellow]? {question}[/bold yellow]")
         for i, label in enumerate(labels, 1):
             console.print(f"   {i}. {label}")

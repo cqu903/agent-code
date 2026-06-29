@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import queue
+import sys
 import threading
 from typing import Any, Callable
 
@@ -51,8 +52,24 @@ def run_on_main_terminal(
     # 真正的 ensure_future 由 run_coroutine_threadsafe 在主线程用显式 loop 完成。
     async def _ask_on_main() -> Any:
         async with in_terminal():
-            # 见约束 3：func 含阻塞 stdin 读，必须 run_in_executor，别在循环线程上跑。
-            return await asyncio.get_running_loop().run_in_executor(None, func)
+            # 约束 4：func 的输出必须直写真实终端，不能走 patch_stdout 代理。
+            # in_terminal 已擦除输入框、关闭渲染并 detach 输入，此刻终端归我们专用，
+            # 直写安全。若让 func（typer.confirm 的 "Run this command? [y/N]:" 这种
+            # 无换行提示 / Rich 预览）写到 patch_stdout 代理，会触发两个问题：
+            #   a) 代理按换行符缓冲，无换行的确认提示永不自动刷出；
+            #   b) 代理的 flush 线程靠 run_in_terminal 写出，而 run_in_terminal 要
+            #      排队等"当前 in_terminal"释放——正是我们自己占着的这个。
+            #      于是确认对话框在用户按回车前根本看不见，REPL 表现为卡死。
+            # 所以这里把 sys.stdout 临时指回 patch_stdout 接管前的真实终端
+            # （= sys.__stdout__），func 直写、立即可见；问完恢复代理。
+            real_stdout = sys.__stdout__
+            saved_stdout = sys.stdout
+            sys.stdout = real_stdout
+            try:
+                # 见约束 3：func 含阻塞 stdin 读，必须 run_in_executor，别在循环线程上跑。
+                return await asyncio.get_running_loop().run_in_executor(None, func)
+            finally:
+                sys.stdout = saved_stdout
 
     return asyncio.run_coroutine_threadsafe(_ask_on_main(), loop).result()
 
