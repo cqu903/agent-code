@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from agent_code.runtime import RuntimeState
+
 
 @dataclass
 class SlashContext:
@@ -16,6 +18,7 @@ class SlashContext:
     model: str
     provider: str
     session_id: str | None
+    state: RuntimeState | None = None
 
 
 class SlashResult:
@@ -84,9 +87,11 @@ def _cmd_model(args: list[str], ctx: SlashContext) -> SlashResult:
             handled=True,
             message=f"provider: {ctx.provider}  model: {ctx.model}",
         )
+    target = args[0]
+    if ctx.state is not None:
+        ctx.state.model = target
     return SlashResult(
-        handled=True,
-        message=f"Cannot change model at runtime. Current: {ctx.provider}/{ctx.model}",
+        handled=True, message=f"model -> {target} (下一轮生效，当前轮不变)"
     )
 
 

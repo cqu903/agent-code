@@ -27,7 +27,7 @@ from .permissions import PermissionsRequest, decide_permission
 from .session import Session
 from .project_memory import load_agent_md
 from .compact_basic import compact
-from .hooks import run_hooks
+from .hooks import run_hooks, run_hooks_raw
 
 console = Console()
 
@@ -110,6 +110,8 @@ def run_agent(
         session.append_messages([messages[-1]])
 
     trace: list[str] = []
+    # Stop hook 续跑次数，封顶 2 防死循环（hook 写错时不至于无限续跑）
+    continuation_count = 0
 
     for _step in range(max_steps):
         # 消息超过40条自动压缩
@@ -125,9 +127,64 @@ def run_agent(
                 provider_data=response.provider_data,
             )
         )
+        # ESC 半步中断——模型已返回（可能带 tool_calls），但任何工具都还没执行。
+        # 主线程在用户按 ESC 时 set 了 state.abort_event；这里检测到就短路返回。
+        if state.abort_event.is_set():
+            emit("interrupted by user")
+            if response.tool_calls:
+                # 配对不变量：assistant 给了 N 个 tool_use，紧跟的下一条必须是带
+                # 同样 N 个 tool_result 的 user 消息（按 tool_use_id 一一配对），
+                # 否则下次请求会被 API 拒。本项目用扁平 Message：每个 tool_result
+                # 是独立的 Message(role="tool")，_to_wire_messages 会把连续的 tool
+                # 消息合并成一条 user 消息，所以逐条追加即可保证配对。
+                interrupted = [
+                    Message(
+                        role="tool",
+                        tool_call_id=c.id,
+                        content="Interrupted by user",
+                        is_error=True,
+                    )
+                    for c in response.tool_calls
+                ]
+                messages.extend(interrupted)
+                if session:
+                    # 落盘：刚追加的 assistant(tool_calls) + 全部 tool_result
+                    session.append_messages(messages[-(len(interrupted) + 1) :])
+            elif session:
+                # 没有 tool_calls：messages[-1] 就是模型的文本回复，单独落盘
+                session.append_messages([messages[-1]])
+            return AgentResult(final="interrupted", trace=trace, messages=messages)
 
         if not response.tool_calls:
             final = response.text or ""
+            # Stop hook：模型自认答完，给 hook 一次"再推一轮"的机会。
+            # 任一 hook 退出码非 0 且 stdout/stderr 有内容 → 内容当"按这个继续"，
+            # 注入一条合成 user 消息再跑一轮（封顶 continuation_count < 2，防死循环）。
+            forced: str | None = None
+            if continuation_count < 2:
+                payload = {
+                    "event": "Stop",
+                    "final_text": final,
+                    "cwd": str(ctx.cwd),
+                    "continuation_count": continuation_count,
+                }
+                for h in run_hooks_raw("Stop", payload, ctx.cwd):
+                    if not h["success"] and h["output"].strip():
+                        forced = h["output"].strip()
+                        break
+            if forced is not None:
+                # 先把模型这一轮的回答展示出来，再 emit continue:——与 day-08 §3.4
+                # 验证输出一致（final: ... → continue: add a unit test）。否则 continue
+                # 分支直接回到 loop 顶，模型刚说的内容被吞掉，用户只看到凭空冒出的
+                # continue:，不知道模型答了什么。
+                emit(f"final: {final}")
+                continuation_count += 1
+                emit(f"continue: {forced}")
+                messages.append(Message(role="user", content=f"continue: {forced}"))
+                if session:
+                    # 落盘 assistant(final) + 合成 user(continue)，保证 --resume 还原完整
+                    session.append_messages(messages[-2:])
+                continue  # 回到 loop 顶，再跑一轮
             emit(f"final: {final}")
             # 把最终 assistant 消息落盘
             if session:
