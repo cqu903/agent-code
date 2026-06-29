@@ -50,6 +50,7 @@ class Tool:
     parameters: dict[str, Any] = field(
         default_factory=lambda: {"type": "object", "properties": {}, "required": []}
     )
+    is_read_only: bool = False
 
 
 _REGISTERED_TOOLS: list[Tool] = []
@@ -110,11 +111,36 @@ class ToolRegistry:
             tool = self._tools[name]
             out.print(f"  [cyan]{name}[/cyan] — {tool.description}")
 
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
+
+# 只读工具白名单：无副作用、可安全并行执行。
+# 其余（写类 / 交互类 / 网络类）保持 is_read_only=False，串行执行。
+_READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "list_files",
+        "glob",
+        "grep",
+        "project_tree",
+        "git_status",
+        "git_diff",
+        "system_date",
+        "echo",
+        "memory_recall",
+        "cron_list",
+    }
+)
+
 
 def default_tools() -> ToolRegistry:
     # tools/__init__.py 顶部已 import 所有工具模块，触发各自的 @register_tool，
     # 调到这里时 _REGISTERED_TOOLS 已填满——纯收集，无需任何延迟导入。
+    # 并发工具编排：白名单内的工具打 is_read_only=True，供上层判定可否并行。
     registry = ToolRegistry()
     for tool in _REGISTERED_TOOLS:
+        if tool.name in _READ_ONLY_TOOL_NAMES:
+            tool.is_read_only = True
         registry.register(tool)
     return registry
