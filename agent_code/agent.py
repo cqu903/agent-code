@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from .messages import Message
 from .model import Provider, ModelResponse
 from .runtime import RuntimeState
-from .tools import ToolRegistry, ToolContext, ToolResult
+from .tools import ToolRegistry, ToolContext, ToolCall
 from .fs_safety import (
     SkipPolicy,
     apply_single_replace,
@@ -66,6 +68,249 @@ def build_system_prompt(cwd: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _format_call_args(args: dict[str, Any]) -> str:
+    """trace 里的工具参数可能很大（file_write 的整段内容）。
+    长字符串只截断到 80 字符做预览，完整参数仍照常传给工具。"""
+    preview: dict[str, Any] = {}
+    for key, value in args.items():
+        if isinstance(value, str) and len(value) > 80:
+            preview[key] = value[:80] + "…"
+        else:
+            preview[key] = value
+    return str(preview)
+
+
+def partition_tool_calls(
+    calls: list[ToolCall], tools: ToolRegistry
+) -> list[list[ToolCall]]:
+    """连续只读工具合成并行组；写 / 未知工具截断、自成单元素组。
+    例：[Read, Read, Write, Read] → [[Read, Read], [Write], [Read]]
+    未知工具（tools.get 为 None）fail-closed 当串行，不并入只读组。"""
+    batches: list[list[ToolCall]] = []
+    current: list[ToolCall] = []
+    for call in calls:
+        tool = tools.get(call.name)
+        if tool is not None and tool.is_read_only:
+            current.append(call)
+        else:
+            if current:  # 写 / 未知工具前先收掉前面攒的只读组
+                batches.append(current)
+                current = []
+            batches.append([call])  # 写 / 未知工具单独一组，串行
+    if current:
+        batches.append(current)
+    return batches
+
+
+def execute_one_tool_call(
+    call: ToolCall,
+    ctx: ToolContext,
+    state: RuntimeState,
+    tools: ToolRegistry,
+    emit: Callable[[str], None],
+) -> Message:
+    """跑单个工具，返回一条 Message(role="tool", ...)。
+
+    内层 for call 循环体原样搬出：每处原来的 append(Message); continue 换成
+    return Message，逻辑一行不改。并发编排时，只读组的多个调用会经
+    ThreadPoolExecutor 并行进入这里——所以函数内不得触碰跨调用共享的可变状态
+    （ctx.read_state 已加锁、trace.append 在 GIL 下原子，均安全）。
+    """
+    emit(f"tool_call: {call.name} {_format_call_args(call.arguments)}")
+
+    # 权限引擎统一入口：所有工具调用先包装成 PermissionRequest
+    request = PermissionsRequest(
+        tool_name=call.name,
+        args=call.arguments,
+        mode=state.permission_mode,
+        cwd=ctx.cwd,
+    )
+    decision = decide_permission(request)
+
+    # plan模式等deny决策已经在上面算出，deny不再执行本地hook，避免hook副作用
+    if decision.behavior != "deny":
+        pre_hooks = run_hooks("PreToolUse", call.name, call.arguments, ctx.cwd)
+        pre_blocked = [h for h in pre_hooks if not h["success"]]
+        if pre_blocked:
+            blocked_msgs = "\n".join(
+                f" [hook] {h['command']}: {h['output']}" for h in pre_blocked
+            )
+            observation = f"tool blocked by PreToolUse hook:\n{blocked_msgs}"
+            emit(f"observation: {observation}")
+            return Message(
+                role="tool",
+                tool_call_id=call.id,
+                content=observation,
+                is_error=True,
+            )
+
+    edit_preview: tuple[str, str, str] | None = None
+    if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
+        # acceptEdits 只跳过确认 UI，不能跳过 Day 4 的安全校验
+        path_str = call.arguments.get("file_path", "")
+        if not path_str:
+            return Message(
+                role="tool",
+                tool_call_id=call.id,
+                content="error: missing required argument 'file_path'",
+                is_error=True,
+            )
+        try:
+            path = resolve_in_cwd(ctx.cwd, path_str)
+        except (ValueError, OSError) as exc:
+            return Message(
+                role="tool",
+                tool_call_id=call.id,
+                content=f"error: {exc}",
+                is_error=True,
+            )
+        if path.is_dir():
+            return Message(
+                role="tool",
+                tool_call_id=call.id,
+                content=f"error: path is a directory: {path_str}",
+                is_error=True,
+            )
+
+        old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+
+        validation_error: str | None = None
+        if call.name == "file_write":
+            if path.exists():
+                validation_error = ensure_read_before_edit(
+                    ctx.read_state, path
+                ) or check_mtime_conflict(ctx.read_state, path)
+            new_content = call.arguments.get("content", "")
+        else:  # file_edit
+            new_content = ""
+            if not path.exists():
+                validation_error = f"error: file does not exist: {path_str}"
+            else:
+                validation_error = ensure_read_before_edit(
+                    ctx.read_state, path
+                ) or check_mtime_conflict(ctx.read_state, path)
+            if validation_error is None:
+                new_content, replace_err = apply_single_replace(
+                    old_content,
+                    call.arguments.get("old_string", ""),
+                    call.arguments.get("new_string", ""),
+                    bool(call.arguments.get("replace_all", False)),
+                )
+                if replace_err is not None:
+                    validation_error = replace_err
+
+        if validation_error is not None:
+            return Message(
+                role="tool",
+                tool_call_id=call.id,
+                content=validation_error,
+                is_error=True,
+            )
+
+        edit_preview = (path_str, old_content, new_content)
+
+    if decision.behavior == "deny":
+        # deny 路径：直接返回 error observation，不弹 UI
+        return Message(
+            role="tool",
+            tool_call_id=call.id,
+            content=f"error: {decision.message}",
+            is_error=True,
+        )
+
+    if decision.behavior == "ask":
+        # ask 路径：按工具类型分发不同的预览和确认 UI。
+        # 仅在用户拒绝时早 return；通过确认则落到末尾 tools.run() 统一执行。
+        if call.name in ("file_write", "file_edit"):
+            # --- 文件编辑：安全校验已经做过；ask 模式只负责 diff + confirm ---
+            # diff 预览放进 confirm_edit 内部打印（和 bash 同理：预览要和确认
+            # 问题一起在 in_terminal 里直写真实终端，否则卡在 patch_stdout）。
+            if edit_preview is not None:
+                path_str, old_content, new_content = edit_preview
+                diff_text = render_diff(old_content, new_content, path_str)
+                if not confirm_edit(path_str, diff_text=diff_text):
+                    return Message(
+                        role="tool",
+                        tool_call_id=call.id,
+                        content="error: edit rejected by user",
+                        is_error=True,
+                    )
+
+        elif call.name == "bash":
+            # --- bash：命令预览 + confirm ---
+            # 预览（Command: / timeout）放进 confirm_command 内部打印，和确认
+            # 问题一起经 run_on_main_terminal → in_terminal 直写真实终端，
+            # 避免预览卡在 patch_stdout 代理里、排到用户回答之后才出现。
+            command = call.arguments.get("command", "")
+            timeout = call.arguments.get("timeout", 30)
+            if not confirm_command(command, timeout=timeout, cwd=ctx.cwd):
+                return Message(
+                    role="tool",
+                    tool_call_id=call.id,
+                    content="error: command rejected by user",
+                    is_error=True,
+                )
+
+        elif call.name in ("web_fetch", "web_search"):
+            # --- 网络工具：不写本地文件，但要让用户确认是否访问外部资源 ---
+            detail = (
+                call.arguments.get("url")
+                or call.arguments.get("query")
+                or str(call.arguments)
+            )
+            if not confirm_tool_use(call.name, detail):
+                return Message(
+                    role="tool",
+                    tool_call_id=call.id,
+                    content="error: tool use rejected by user",
+                    is_error=True,
+                )
+
+        elif call.name == "ask_user_question":
+            # ask_user_question 的"结果"就是用户选择，内联算出后直接 return，
+            # 不落到末尾 tools.run()。
+            question = call.arguments.get("prompt", "")
+            options = call.arguments.get("options", [])
+            if not isinstance(options, list):
+                options = []
+            labels = [str(o) for o in options]
+            selected = prompt_single_choice(question, labels)
+            if selected is None:
+                content = "User skipped the question."
+            else:
+                content = f'User selected: "{selected}"'
+            emit(f"observation: {content}")
+            return Message(
+                role="tool",
+                tool_call_id=call.id,
+                content=content,
+                is_error=False,
+            )
+
+    # allow 路径 + ask 通过：执行工具
+    result = tools.run(call, ctx)
+    emit(f"observation: {result.content}")
+
+    # PostToolUse hooks - 在工具执行成功后运行，失败不阻断
+    if not result.is_error:
+        post_hooks = run_hooks(
+            "PostToolUse",
+            call.name,
+            call.arguments,
+            ctx.cwd,
+            tool_result=result.content,
+        )
+        for h in post_hooks:
+            status = "ok" if h["success"] else f"warning: {h['output']}"
+            console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
+    return Message(
+        role="tool",
+        tool_call_id=result.tool_call_id,
+        content=result.content,
+        is_error=result.is_error,
+    )
+
+
 def run_agent(
     prompt: str,
     provider: Provider,
@@ -85,7 +330,11 @@ def run_agent(
     )
 
     def emit(line: str) -> None:
-        # 流式输出trace： append给测试用
+        # 工具结果可能很长，且并行读时多份 observation 并发打印会乱序：
+        # 完整 observation 只通过 tool_result 回填给模型（并落盘 session），
+        # 终端 / trace 只保留 tool_call / final / interrupted / continue。
+        if line.startswith("observation:"):
+            return
         trace.append(line)
         # highlight=False：emit 打印的是模型文本/工具结果（含代码片段），
         # 默认 highlight=True 会在 TTY 下给 "func(" 之类套 ANSI 高亮码，
@@ -191,267 +440,29 @@ def run_agent(
                 session.append_messages([messages[-1]])
             return AgentResult(final=final, trace=trace, messages=messages)
 
-        for call in response.tool_calls:
-            emit(f"tool_call: {call.name} {call.arguments}")
-
-            # 权限引擎统一入口：所有工具调用先包装成 PermissionRequest
-            request = PermissionsRequest(
-                tool_name=call.name,
-                args=call.arguments,
-                mode=state.permission_mode,
-                cwd=ctx.cwd,
-            )
-            decision = decide_permission(request)
-
-            # plan模式等deny决策已经在上面算出，deny不再执行本地hook，避免hook副作用
-            if decision.behavior != "deny":
-                pre_hooks = run_hooks("PreToolUse", call.name, call.arguments, ctx.cwd)
-                pre_blocked = [h for h in pre_hooks if not h["success"]]
-                if pre_blocked:
-                    blocked_msgs = "\n".join(
-                        f" [hook] {h['command']}: {h['output']}" for h in pre_blocked
-                    )
-                    observation = f"tool blocked by PreToolUse hook:\n{blocked_msgs}"
-                    emit(f"observation: {observation}")
-                    messages.append(
-                        Message(
-                            role="tool",
-                            tool_call_id=call.id,
-                            content=observation,
-                            is_error=True,
-                        )
-                    )
-                    continue
-
-            edit_preview: tuple[str, str, str] | None = None
-            if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
-                # acceptEdits 只跳过确认 UI，不能跳过 Day 4 的安全校验
-                path_str = call.arguments.get("file_path", "")
-                if not path_str:
-                    result = ToolResult(
-                        call.id,
-                        "error: missing required argument 'file_path'",
-                        is_error=True,
-                    )
-                    emit(f"observation: {result.content}")
-                    messages.append(
-                        Message(
-                            role="tool",
-                            tool_call_id=call.id,
-                            content=result.content,
-                            is_error=True,
-                        )
-                    )
-                    continue
-                try:
-                    path = resolve_in_cwd(ctx.cwd, path_str)
-                except (ValueError, OSError) as exc:
-                    result = ToolResult(call.id, f"error: {exc}", is_error=True)
-                    emit(f"observation: {result.content}")
-                    messages.append(
-                        Message(
-                            role="tool",
-                            tool_call_id=result.tool_call_id,
-                            content=result.content,
-                            is_error=True,
-                        )
-                    )
-                    continue
-                if path.is_dir():
-                    result = ToolResult(
-                        call.id,
-                        f"error: path is a directory: {path_str}",
-                        is_error=True,
-                    )
-                    emit(f"observation: {result.content}")
-                    messages.append(
-                        Message(
-                            role="tool",
-                            tool_call_id=result.tool_call_id,
-                            content=result.content,
-                            is_error=True,
-                        )
-                    )
-                    continue
-
-                old_content = path.read_text(encoding="utf-8") if path.exists() else ""
-
-                validation_error: str | None = None
-                if call.name == "file_write":
-                    if path.exists():
-                        validation_error = ensure_read_before_edit(
-                            ctx.read_state, path
-                        ) or check_mtime_conflict(ctx.read_state, path)
-                    new_content = call.arguments.get("content", "")
-                else:  # file_edit
-                    new_content = ""
-                    if not path.exists():
-                        validation_error = f"error: file does not exist: {path_str}"
-                    else:
-                        validation_error = ensure_read_before_edit(
-                            ctx.read_state, path
-                        ) or check_mtime_conflict(ctx.read_state, path)
-                    if validation_error is None:
-                        new_content, replace_err = apply_single_replace(
-                            old_content,
-                            call.arguments.get("old_string", ""),
-                            call.arguments.get("new_string", ""),
-                            bool(call.arguments.get("replace_all", False)),
-                        )
-                        if replace_err is not None:
-                            validation_error = replace_err
-
-                if validation_error is not None:
-                    result = ToolResult(call.id, validation_error, is_error=True)
-                    emit(f"observation: {result.content}")
-                    messages.append(
-                        Message(
-                            role="tool",
-                            tool_call_id=result.tool_call_id,
-                            content=result.content,
-                            is_error=True,
-                        )
-                    )
-                    continue
-
-                edit_preview = (path_str, old_content, new_content)
-
-            if decision.behavior == "deny":
-                # deny 路径：直接返回 error observation，不弹 UI
-                result = ToolResult(
-                    call.id, f"error: {decision.message}", is_error=True
+        # 并发编排（day-08 §4.3）：连续只读工具凑成并行组，写 / 未知工具截断、串行执行。
+        # 回填给模型的 tool_result 顺序必须 == tool_use 顺序（Anthropic 配对不变量）；
+        # ThreadPoolExecutor.map 按输入顺序返回结果，天然对齐，无需手动重排。
+        tool_messages: list[Message] = []
+        for batch in partition_tool_calls(response.tool_calls, tools):
+            if len(batch) == 1:
+                tool_messages.append(
+                    execute_one_tool_call(batch[0], ctx, state, tools, emit)
                 )
-                emit(f"observation: {result.content}")
-                messages.append(
-                    Message(
-                        role="tool",
-                        tool_call_id=result.tool_call_id,
-                        content=result.content,
-                        is_error=True,
-                    )
-                )
-                continue
-
-            elif decision.behavior == "ask":
-                # ask 路径：按工具类型分发不同的预览和确认 UI
-                if call.name in ("file_write", "file_edit"):
-                    # --- 文件编辑：安全校验已经做过；ask 模式只负责 diff + confirm ---
-                    # diff 预览放进 confirm_edit 内部打印（和 bash 同理：预览要和确认
-                    # 问题一起在 in_terminal 里直写真实终端，否则卡在 patch_stdout）。
-                    if edit_preview is not None:
-                        path_str, old_content, new_content = edit_preview
-                        diff_text = render_diff(old_content, new_content, path_str)
-                        if not confirm_edit(path_str, diff_text=diff_text):
-                            result = ToolResult(
-                                call.id, "error: edit rejected by user", is_error=True
-                            )
-                            emit(f"observation: {result.content}")
-                            messages.append(
-                                Message(
-                                    role="tool",
-                                    tool_call_id=result.tool_call_id,
-                                    content=result.content,
-                                    is_error=True,
-                                )
-                            )
-                            continue
-
-                elif call.name == "bash":
-                    # --- bash：命令预览 + confirm ---
-                    # 预览（Command: / timeout）放进 confirm_command 内部打印，和确认
-                    # 问题一起经 run_on_main_terminal → in_terminal 直写真实终端，
-                    # 避免预览卡在 patch_stdout 代理里、排到用户回答之后才出现。
-                    command = call.arguments.get("command", "")
-                    timeout = call.arguments.get("timeout", 30)
-                    if not confirm_command(command, timeout=timeout, cwd=ctx.cwd):
-                        result = ToolResult(
-                            call.id, "error: command rejected by user", is_error=True
-                        )
-                        emit(f"observation: {result.content}")
-                        messages.append(
-                            Message(
-                                role="tool",
-                                tool_call_id=result.tool_call_id,
-                                content=result.content,
-                                is_error=True,
-                            )
-                        )
-                        continue
-
-                elif call.name in ("web_fetch", "web_search"):
-                    # --- 网络工具：不写本地文件，但要让用户确认是否访问外部资源 ---
-                    detail = (
-                        call.arguments.get("url")
-                        or call.arguments.get("query")
-                        or str(call.arguments)
-                    )
-                    if not confirm_tool_use(call.name, detail):
-                        result = ToolResult(
-                            call.id, "error: tool use rejected by user", is_error=True
-                        )
-                        emit(f"observation: {result.content}")
-                        messages.append(
-                            Message(
-                                role="tool",
-                                tool_call_id=result.tool_call_id,
-                                content=result.content,
-                                is_error=True,
-                            )
-                        )
-                        continue
-
-                elif call.name == "ask_user_question":
-                    question = call.arguments.get("prompt", "")
-                    options = call.arguments.get("options", [])
-                    if not isinstance(options, list):
-                        options = []
-                    labels = [str(o) for o in options]
-                    selected = prompt_single_choice(question, labels)
-                    if selected is None:
-                        result = ToolResult(
-                            call.id, "User skipped the question.", is_error=False
-                        )
-                    else:
-                        result = ToolResult(
-                            call.id, f'User selected: "{selected}"', is_error=False
-                        )
-                    emit(f"observation: {result.content}")
-                    messages.append(
-                        Message(
-                            role="tool",
-                            tool_call_id=result.tool_call_id,
-                            content=result.content,
-                            is_error=result.is_error,
+            else:
+                # 只读组并行（max_workers=4 够用，非性能调优重点）。
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    tool_messages.extend(
+                        ex.map(
+                            lambda c: execute_one_tool_call(c, ctx, state, tools, emit),
+                            batch,
                         )
                     )
-                    continue
-
-            # allow 路径 + ask 通过：执行工具
-            result = tools.run(call, ctx)
-            emit(f"observation: {result.content}")
-
-            # PostToolUse hooks - 在工具执行成功后运行，失败不阻断
-            if not result.is_error:
-                post_hooks = run_hooks(
-                    "PostToolUse",
-                    call.name,
-                    call.arguments,
-                    ctx.cwd,
-                    tool_result=result.content,
-                )
-                for h in post_hooks:
-                    status = "ok" if h["success"] else f"warning: {h['output']}"
-                    console.print(f"[dim]hook: PostToolUse {call.name} {status}[/dim]")
-            messages.append(
-                Message(
-                    role="tool",
-                    tool_call_id=result.tool_call_id,
-                    content=result.content,
-                    is_error=result.is_error,
-                )
-            )
-            if session:
-                session.append_messages(messages[-2:])
+        messages.extend(tool_messages)
+        # 落盘：assistant(tool_calls) + 全部 tool_result 各一次（扁平消息模型下
+        # _to_wire_messages 会把连续 role="tool" 合并成一条 user 消息，配对不变量成立）。
+        if session:
+            session.append_messages(messages[-(len(tool_messages) + 1) :])
 
     final = f"reached max_steps={max_steps}"
     emit(f"final: {final}")
