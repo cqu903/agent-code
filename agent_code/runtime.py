@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class TodoItem:
+    content: str  # 要做什么（祈使句，如 "实现 reverse 函数"）
+    status: str  # pending | in_progress | completed
+    active_form: str  # 正在做什么（进行时，如 "正在实现 reverse 函数"）
+
+
+@dataclass
 class RuntimeState:
     # 主线程（输入/键位/状态栏）写这些；worker 线程（Agent Loop）读这些。
     permission_mode: str = "default"  # default | acceptEdits | plan，shift+tab 改它
@@ -14,6 +21,7 @@ class RuntimeState:
     provider: str = "anthropic"
     abort_event: threading.Event = field(default_factory=threading.Event)
     input_queue: queue.Queue[str] = field(default_factory=queue.Queue)
+    todo_store: list[TodoItem] = field(default_factory=list)
 
     def cycle_permission_mode(self) -> str:
         """shift+tab 循环：default → acceptEdits → plan → default。只主线程调，无需锁。"""
