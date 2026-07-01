@@ -74,13 +74,17 @@ def run_once(
     max_steps,
     permission_mode,
     session=None,
-    system_prompt=None,
+    skill_allowed_tools=None,
 ) -> None:
     provider_name = _provider_name(provider.base_url)
     render_header(cwd, provider_name, provider.model)
     state = RuntimeState(
         permission_mode=permission_mode, model=provider.model, provider=provider_name
     )
+    # /skill 本轮白名单跟着这一次 run_once 走（one-shot 路径）。
+    # system prompt 每次重新拼，避免启动时固化（v4 output-style 也靠这个）。
+    state.skill_allowed_tools = skill_allowed_tools
+    system_prompt = build_system_prompt(cwd, state)
     run_agent(
         prompt,
         provider,
@@ -130,7 +134,6 @@ def main_command(
 
     provider = AnthropicProvider(model=model, base_url=base_url)
     provider_name = _provider_name(provider.base_url)
-    system_prompt = build_system_prompt(resolved_cwd)
 
     def run_user_input(line: str) -> None:
         """
@@ -161,7 +164,7 @@ def main_command(
                     max_steps,
                     permission_mode,
                     session=session,
-                    system_prompt=system_prompt,
+                    skill_allowed_tools=slash_result.allowed_tools,
                 )
             return
         if session is None:
@@ -174,7 +177,6 @@ def main_command(
             max_steps,
             permission_mode,
             session=session,
-            system_prompt=system_prompt,
         )
 
     if text:
@@ -199,9 +201,11 @@ def main_command(
     scheduler.start()
 
     def run_turn(line: str) -> None:
-        # slash 已在主线程处理过，这里只跑 agent
-        # provider 每轮按 state.model 重建，所以 /model 切换下一轮才生效
+        # slash 已在主线程处理过，这里只跑 agent。
+        # provider 和 system prompt 都按 RuntimeState 每轮重建，所以 /model、
+        # /output-style、/skill 白名单切换都是下一轮生效——不能在启动时固化。
         trun_provider = create_provider(state.provider, state.model, base_url)
+        turn_system_prompt = build_system_prompt(resolved_cwd, state)
         run_agent(
             line,
             trun_provider,
@@ -210,7 +214,7 @@ def main_command(
             cwd=resolved_cwd,
             state=state,
             session=session,
-            system_prompt=system_prompt,
+            system_prompt=turn_system_prompt,
         )
 
     def make_slash_context() -> SlashContext:

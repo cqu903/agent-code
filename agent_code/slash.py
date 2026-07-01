@@ -30,11 +30,13 @@ class SlashResult:
         should_query: bool = False,
         prompt: str = "",
         message: str = "",
+        allowed_tools: list[str] | None = None,
     ) -> None:
         self.handled = handled
         self.should_query = should_query
         self.prompt = prompt
         self.message = message
+        self.allowed_tools = allowed_tools
 
 
 SlashHandler = Callable[[list[str], SlashContext], SlashResult]
@@ -129,18 +131,21 @@ def _cmd_permissions(args: list[str], ctx: SlashContext) -> SlashResult:
 
 
 def _cmd_plan(args: list[str], ctx: SlashContext) -> SlashResult:
-    if args and args[0] == "off":
+    """热切换 plan 模式（Day 8 v6）。/plan 进 plan、/plan off 退回 default。
+    shift+tab、/plan、enter_plan_mode 三条路径改的是同一个 state.permission_mode，
+    没有第二份状态。one-shot 没注入 state 时回退提示。"""
+    if ctx.state is None:
         return SlashResult(
             handled=True,
-            message="当前版本不在 REPL 内热切换权限模式。请重新用 --permission-mode default 启动。",
+            message="plan 模式热切换需要交互 shell（state 未注入）",
         )
-    if ctx.permission_mode == "plan":
-        return SlashResult(
-            handled=True, message="当前已经是 plan 模式。完整审批闭环会在 Day 8 实现。"
-        )
+    if args and args[0] == "off":
+        ctx.state.permission_mode = "default"
+        return SlashResult(handled=True, message="exited plan mode")
+    ctx.state.permission_mode = "plan"
     return SlashResult(
         handled=True,
-        message="要进入 plan 模式，请重新用 --permission-mode plan 启动。完整审批闭环会在 Day 8 实现。",
+        message="entered plan mode（写工具被禁，用 exit_plan_mode 提交计划）",
     )
 
 
@@ -237,10 +242,98 @@ def _cmd_loop(args: list[str], ctx: SlashContext) -> SlashResult:
     return SlashResult(handled=True, message=f"Unknown /loop subcommand: {subcommand}")
 
 
+def _cmd_todo(_args: list[str], ctx: SlashContext) -> SlashResult:
+    items = ctx.state.todo_store if ctx.state else []
+    icon = {"pending": "○", "in_progress": "◉", "completed": "✓"}
+    body = (
+        "\n".join(f"  {icon.get(t.status, '?')} {t.content}" for t in items)
+        or "(no todos)"
+    )
+    return SlashResult(handled=True, message=body)
+
+
+def _cmd_skills(_args: list[str], ctx: SlashContext) -> SlashResult:
+    from .skills import SkillLoader
+
+    loader = SkillLoader(ctx.cwd)
+    message = loader.render_list()
+    if loader.warnings:
+        message += "\n\nwarnings:\n" + "\n".join(f"- {w}" for w in loader.warnings)
+    return SlashResult(handled=True, message=message)
+
+
+def _cmd_skill(_args: list[str], ctx: SlashContext) -> SlashResult:
+    from .skills import SkillLoader
+
+    if not _args:
+        return SlashResult(handled=True, message="用法: /skill <name> [任务]")
+    name = _args[0]
+    task = " ".join(_args[1:]).strip() or "按这个 skill 的流程完成当前任务。"
+    skill = SkillLoader(ctx.cwd).load(name)
+    if skill is None:
+        return SlashResult(handled=True, message=f"skill not found: {name}")
+    prompt = (
+        f"Use this skill for the next task.\n\n"
+        f'<skill name="{skill.name}">\n{skill.body}\n</skill>\n\n'
+        f"Task: {task}"
+    )
+    # message= 用于终端回显，prompt= 才是 cli.py 调 run_once 喂给 Agent Loop 的内容。
+    # 漏掉 prompt= 会让 Agent Loop 拿到空串 → 发一条 content 为空的 user 消息 → 被 GLM 拒（1213）。
+    return SlashResult(
+        handled=True,
+        prompt=prompt,
+        should_query=True,
+        allowed_tools=skill.allowed_tools,
+    )
+
+
+def _cmd_output_style(args: list[str], ctx: SlashContext) -> SlashResult:
+    from .output_styles import list_output_styles, load_output_style
+
+    if ctx.state is None:
+        return SlashResult(handled=True, message="output-style 需要交互 shell")
+
+    subcommand = args[0] if args else "list"
+    if subcommand == "list":
+        styles = list_output_styles(ctx.cwd)
+        if not styles:
+            return SlashResult(handled=True, message="(no output styles found)")
+        lines = [
+            f"{style.name}  {style.description}" if style.description else style.name
+            for style in styles
+        ]
+        current = ctx.state.output_style or "(default)"
+        return SlashResult(
+            handled=True, message=f"current: {current}\n" + "\n".join(lines)
+        )
+
+    if subcommand == "use":
+        if len(args) < 2:
+            return SlashResult(handled=True, message="用法: /output-style use <name>")
+        name = args[1]
+        if load_output_style(ctx.cwd, name) is None:
+            return SlashResult(handled=True, message=f"output style not found: {name}")
+        ctx.state.output_style = name
+        return SlashResult(handled=True, message=f"output style -> {name}")
+
+    if subcommand == "reset":
+        ctx.state.output_style = None
+        return SlashResult(handled=True, message="output style reset")
+
+    return SlashResult(
+        handled=True,
+        message="用法: /output-style list | /output-style use <name> | /output-style reset",
+    )
+
+
 register("help", "显示所有可用 slash command", _cmd_help)
 register("model", "显示当前模型/provider", _cmd_model)
 register("context", "显示当前 session、cwd、权限模式", _cmd_context)
 register("compact", "显示 compact 状态", _cmd_compact)
 register("permissions", "显示权限模式 (default/acceptEdits/plan)", _cmd_permissions)
 register("plan", "显示 plan 模式提示", _cmd_plan)
-register("loop", "管理 cron 定时任务：add/list/cancel", _cmd_loop)
+register("loop", "管理 cron 定时任" "务：add/list/cancel", _cmd_loop)
+register("todo", "现实当前 todo 列表", _cmd_todo)
+register("skills", "列出本地 .agent/skills 里的skill", _cmd_skills)
+register("skill", "用指定 skill 执行本轮任务", _cmd_skill)
+register("output-style", "列出/切换/重置当前回答风格", _cmd_output_style)

@@ -114,6 +114,22 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def filtered(self, allowed_names: list[str] | None) -> "ToolRegistry":
+        """给模型看的工具面。None=不收敛（返回自身）；[]=不给任何工具；[a,b]=只留这些。
+
+        /skill 本轮白名单的第一道闸：先在 schema 层过滤，让模型压根看不到越界
+        工具，从根上减少越界 tool_call。第二道闸在 permissions.decide_permission，
+        兜底拦住模型用历史上下文发出的越界调用。
+        """
+        if allowed_names is None:
+            return self
+        registry = ToolRegistry()
+        for name in allowed_names:
+            tool = self.get(name)
+            if tool is not None:
+                registry.register(tool)
+        return registry
+
 
 # 只读工具白名单：无副作用、可安全并行执行。
 # 其余（写类 / 交互类 / 网络类）保持 is_read_only=False，串行执行。
@@ -130,6 +146,9 @@ _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
         "echo",
         "memory_recall",
         "cron_list",
+        "todo_read",
+        "skill_list",
+        "skill_load",
     }
 )
 

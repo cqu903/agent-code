@@ -24,8 +24,9 @@ from .prompt_ui import (
     confirm_tool_use,
     render_diff,
     prompt_single_choice,
+    confirm_plan,
 )
-from .permissions import PermissionsRequest, decide_permission
+from .permissions import PermissionRequest, decide_permission
 from .session import Session
 from .project_memory import load_agent_md
 from .compact_basic import compact
@@ -49,12 +50,18 @@ _SYSTEM_CORE = (
 )
 
 
-def build_system_prompt(cwd: Path) -> str:
+def build_system_prompt(cwd: Path, state: RuntimeState | None = None) -> str:
     """
-    组装 system prompt：核心指南 + AGENT.md + MEMORY.md 索引。
-    注入顺序：core prompt → 项目规则 → 跨 session 记忆索引。
+    组装 system prompt：核心指南 + 项目规则 + 记忆索引 + skill 目录 + output style
+    最后组装完的顺序：
+        core prompt
+        AGENT.md
+        <project-memory>
+        <available-skills>
+        output-style
     """
     from .memdir.store import load_index as load_memory_index
+    from .skills import SkillLoader
 
     parts: list[str] = [_SYSTEM_CORE]
     agent_md = load_agent_md(cwd)
@@ -64,6 +71,19 @@ def build_system_prompt(cwd: Path) -> str:
     memory_index = load_memory_index(cwd)
     if memory_index:
         parts.append(f"<project-memory>\n{memory_index}\n</project-memory>")
+
+    available_skills = SkillLoader(cwd).render_available_skills()
+    if available_skills:
+        parts.append(available_skills)
+
+    if state is not None:
+        from .output_styles import render_output_style
+
+        output_style = render_output_style(cwd, state.output_style)
+        if output_style:
+            # 风格层放最后，能影响表达方式，但不应该覆盖项目规则和权限边界
+
+            parts.append(output_style)
 
     return "\n\n".join(parts)
 
@@ -119,11 +139,12 @@ def execute_one_tool_call(
     emit(f"tool_call: {call.name} {_format_call_args(call.arguments)}")
 
     # 权限引擎统一入口：所有工具调用先包装成 PermissionRequest
-    request = PermissionsRequest(
+    request = PermissionRequest(
         tool_name=call.name,
         args=call.arguments,
         mode=state.permission_mode,
         cwd=ctx.cwd,
+        allowed_tools=state.skill_allowed_tools,
     )
     decision = decide_permission(request)
 
@@ -143,6 +164,21 @@ def execute_one_tool_call(
                 content=observation,
                 is_error=True,
             )
+        if call.name == "exit_plan_mode":
+            plan_summary = call.arguments.get("plan_summary", "")
+            if not confirm_plan(plan_summary):
+                # 只通知拒绝、不指挥：不写「再调一次 exit_plan_mode」之类指令，
+                # 否则模型下一轮立刻重交计划 → 审批面板反复弹出，像拒绝没被处理。
+                # 是否重交交给模型自己判断。
+                obs = "The user did not approve the plan."
+                emit(f"observation: {obs}")
+                return Message(
+                    role="tool",
+                    tool_call_id=call.id,
+                    content=obs,
+                    is_error=True,
+                )
+            state.permission_mode = "acceptEdits"
 
     edit_preview: tuple[str, str, str] | None = None
     if call.name in ("file_write", "file_edit") and decision.behavior != "deny":
@@ -367,7 +403,13 @@ def run_agent(
         if len(messages) > 40:
             messages = compact(messages, keep=8)
             console.print(f"[dim]compacted: {len(messages)} messages remaining[/dim]")
-        response = provider.complete(messages, tools=tools.list(), system=system_prompt)
+        # /skill 本轮白名单第一道闸：先过滤给模型的工具 schema，让模型压根
+        # 看不到越界工具。state.skill_allowed_tools 由 interactive.worker_loop
+        # 或 cli.run_once 在 job 开始前设置（/skill 命令携带），跑完恢复。
+        visible_tools = tools.filtered(state.skill_allowed_tools)
+        response = provider.complete(
+            messages, tools=visible_tools.list(), system=system_prompt
+        )
         messages.append(
             Message(
                 role="assistant",
@@ -406,6 +448,25 @@ def run_agent(
 
         if not response.tool_calls:
             final = response.text or ""
+            # plan 模式下，模型这一轮没再调工具就说明计划写完了——turn 边界即审批检查点。
+            if state.permission_mode == "plan" and final.strip():
+                if confirm_plan(final):
+                    state.permission_mode = "acceptEdits"
+                    messages.append(
+                        Message(role="user", content="Plan approved. Implement it now.")
+                    )
+                else:
+                    # 只通知拒绝、不指挥：不写「重新呈现计划」之类指令，否则模型
+                    # 下一轮立刻重交 → 审批面板反复弹出。是否重交交给模型自己判断。
+                    messages.append(
+                        Message(
+                            role="user",
+                            content="The user did not approve the plan.",
+                        )
+                    )
+                if session:
+                    session.append_messages(messages[-2:])
+                continue
             # Stop hook：模型自认答完，给 hook 一次"再推一轮"的机会。
             # 任一 hook 退出码非 0 且 stdout/stderr 有内容 → 内容当"按这个继续"，
             # 注入一条合成 user 消息再跑一轮（封顶 continuation_count < 2，防死循环）。
@@ -444,17 +505,19 @@ def run_agent(
         # 回填给模型的 tool_result 顺序必须 == tool_use 顺序（Anthropic 配对不变量）；
         # ThreadPoolExecutor.map 按输入顺序返回结果，天然对齐，无需手动重排。
         tool_messages: list[Message] = []
-        for batch in partition_tool_calls(response.tool_calls, tools):
+        for batch in partition_tool_calls(response.tool_calls, visible_tools):
             if len(batch) == 1:
                 tool_messages.append(
-                    execute_one_tool_call(batch[0], ctx, state, tools, emit)
+                    execute_one_tool_call(batch[0], ctx, state, visible_tools, emit)
                 )
             else:
                 # 只读组并行（max_workers=4 够用，非性能调优重点）。
                 with ThreadPoolExecutor(max_workers=4) as ex:
                     tool_messages.extend(
                         ex.map(
-                            lambda c: execute_one_tool_call(c, ctx, state, tools, emit),
+                            lambda c: execute_one_tool_call(
+                                c, ctx, state, visible_tools, emit
+                            ),
                             batch,
                         )
                     )

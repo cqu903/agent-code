@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-# hooks.json1 放在cwd下，是最顶级的hook配置
+# hooks.json 放在cwd下，是最顶级的hook配置
 HOOKS_FILE = "hooks.json"
 
 

@@ -12,6 +12,7 @@ import contextlib
 import queue
 import sys
 import threading
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from prompt_toolkit import PromptSession
@@ -74,6 +75,19 @@ def run_on_main_terminal(
     return asyncio.run_coroutine_threadsafe(_ask_on_main(), loop).result()
 
 
+@dataclass
+class AgentJob:
+    """job_queue 的队列项。
+
+    普通输入只有 prompt；/skill 这一轮还带 allowed_tools，由 worker 在跑这个
+    job 前设到 state.skill_allowed_tools、跑完在 finally 恢复——这样白名单
+    只活一轮，不泄漏到后面的普通对话（state.input_queue 仍只存纯文本）。
+    """
+
+    prompt: str
+    allowed_tools: list[str] | None = None
+
+
 class _ReplDispatcher:
     """REPL 输入分发 + worker 循环：主线程 submit，worker 线程 worker_loop。
 
@@ -91,7 +105,7 @@ class _ReplDispatcher:
         self.state = state
         self.run_turn = run_turn
         self.make_slash_context = make_slash_context
-        self.job_queue: queue.Queue[str] = queue.Queue()
+        self.job_queue: queue.Queue[AgentJob | None] = queue.Queue()
         self.busy = threading.Event()
 
     def submit(self, text: str) -> None:
@@ -104,33 +118,38 @@ class _ReplDispatcher:
                     # 不能用裸 print——否则标记原样泄漏成字面 [bold] 标签。
                     console.print(result.message)
                 if result.should_query:
-                    self.job_queue.put(result.prompt)
+                    self.job_queue.put(AgentJob(result.prompt, result.allowed_tools))
                 return
         if self.busy.is_set():
             self.state.input_queue.put(text)
             print("[queued] turn 结束后自动处理")
         else:
-            self.job_queue.put(text)
+            self.job_queue.put(AgentJob(text))
 
     def worker_loop(self) -> None:
         while True:
-            text = self.job_queue.get()
-            if text == "__EXIT__":
+            job = self.job_queue.get()
+            if job is None:
                 break
+            # 白名单生命周期跟着 job 走：跑前设、finally 恢复，只活这一轮，
+            # 不污染后续普通对话（/skill debug-test 跑完后普通输入工具面复原）。
+            old_allowed_tools = self.state.skill_allowed_tools
+            self.state.skill_allowed_tools = job.allowed_tools
             self.state.abort_event.clear()
             self.busy.set()
             try:
-                self.run_turn(text)
+                self.run_turn(job.prompt)
             except Exception as exc:
                 print(f"[error] {exc}")
             finally:
+                self.state.skill_allowed_tools = old_allowed_tools
                 self.busy.clear()
             # turn 结束后回灌排队期间攒下的输入——这是 [queued] 提示对用户的承诺。
             while not self.state.input_queue.empty():
-                self.job_queue.put(self.state.input_queue.get())
+                self.job_queue.put(AgentJob(self.state.input_queue.get()))
 
     def stop(self) -> None:
-        self.job_queue.put("__EXIT__")
+        self.job_queue.put(None)
 
 
 def run_interactive_shell(
@@ -225,4 +244,10 @@ def bottom_toolbar(state: RuntimeState) -> str:
     mode = {"default": "default", "acceptEdits": "accept edits", "plan": "plan"}.get(
         state.permission_mode, state.permission_mode
     )
-    return f" {mode} · {state.model} "
+    # 状态栏读出当前 in_progress 那条 todo 的 active_form，挂在尾部
+    active = next(
+        (t.active_form for t in state.todo_store if t.status == "in_progress"), ""
+    )
+    style = f" · style:{state.output_style}" if state.output_style else ""
+    todo = f" · {active}" if active else ""
+    return f" {mode} · {state.model}{style}{todo} "

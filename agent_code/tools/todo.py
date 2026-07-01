@@ -1,7 +1,11 @@
+"""待办工具：todo_write（整表覆盖）、todo_read（读取当前列表）。"""
+
+from __future__ import annotations
+
 from typing import Any
 
-from agent_code.runtime import TodoItem
-from agent_code.tools import ToolContext
+from ..runtime import TodoItem
+from .base import ToolContext, register_tool
 
 
 def _render_todos(items: list[TodoItem]) -> str:
@@ -12,8 +16,43 @@ def _render_todos(items: list[TodoItem]) -> str:
     )
 
 
+@register_tool(
+    name="todo_write",
+    description=(
+        "Create and manage a structured task list. Use for multi-step tasks (3+ steps). "
+        "Keep exactly ONE item in_progress. Mark completed immediately when done. "
+        "The todos array is a FULL replacement—always send the entire list."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Imperative task name.",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                        },
+                        "activeForm": {
+                            "type": "string",
+                            "description": "Present-continuous form.",
+                        },
+                    },
+                    "required": ["content", "status", "activeForm"],
+                },
+            },
+        },
+        "required": ["todos"],
+    },
+)
 def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
-    """整表覆盖待办版，每次调用传来的todos就是新列表的全部"""
+    """整表覆盖待办版，每次调用传来的 todos 就是新列表的全部。"""
     state = ctx.runtime_state
     if state is None:
         return "error: no runtime state"
@@ -21,7 +60,7 @@ def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
         TodoItem(
             content=t.get("content", ""),
             status=t.get("status", "pending"),
-            active_form=t.get("active_form", ""),
+            active_form=t.get("activeForm", ""),
         )
         for t in args.get("todos", [])
     ]
@@ -39,6 +78,12 @@ def todo_write(args: dict[str, Any], ctx: ToolContext) -> str:
     return "\n".join(lines)
 
 
+@register_tool(
+    name="todo_read",
+    description="Read the current todo list.",
+    parameters={"type": "object", "properties": {}, "required": []},
+)
 def todo_read(args: dict[str, Any], ctx: ToolContext) -> str:
+    """读取当前待办列表。"""
     state = ctx.runtime_state
     return _render_todos(state.todo_store) if state else "(no todos)"

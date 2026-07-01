@@ -6,13 +6,15 @@ from typing import Literal
 
 
 @dataclass
-class PermissionsRequest:
+class PermissionRequest:
     """一次工具调用的权限请求，工具只描述意图，是否执行交给harness决定"""
 
     tool_name: str
     args: dict
     mode: str
     cwd: Path
+    # /skill 本轮工具白名单。None=不收敛；列表=只允许列表内工具。
+    allowed_tools: list[str] | None = None
 
 
 @dataclass
@@ -61,21 +63,40 @@ _READONLY_TOOLS = frozenset(
         "system_date",
         "echo",
         "memory_recall",
-        "corn_list",
+        "cron_list",
+        "todo_read",
+        "skill_list",
+        "skill_load",
     }
 )
 
-_LOW_RISK_WRITES = frozenset({"memory_write", "cron_create", "cron_cancel"})
+_LOW_RISK_WRITES = frozenset(
+    {
+        "memory_write",
+        "cron_create",
+        "cron_cancel",
+        "todo_write",
+        "enter_plan_mode",
+        "exit_plan_mode",
+    }
+)
 
 # 交互和网络都不是写入，但仍需要用户知道 Agent 正在停下来问人或访问外部资源。
 _ASK_TOOLS = frozenset({"ask_user_question", "web_fetch", "web_search"})
 
 
-def decide_permission(request: PermissionsRequest) -> PermissionDecision:
+def decide_permission(request: PermissionRequest) -> PermissionDecision:
     """权限引擎入口：根据工具名、参数和当前模式决定 allow / ask / deny"""
     tool_name = request.tool_name
     args = request.args
     mode = request.mode
+
+    # /skill 本轮白名单兜底：即便模型用历史上下文发出越界 tool_call（工具池
+    # filtered 没拦住的那类），这里也直接 deny。优先级最高，先于任何模式判定。
+    if request.allowed_tools is not None and tool_name not in request.allowed_tools:
+        return PermissionDecision(
+            "deny", f"skill allowed_tools does not allow {tool_name}"
+        )
 
     if tool_name in _ASK_TOOLS:
         return PermissionDecision(behavior="ask")
@@ -85,6 +106,14 @@ def decide_permission(request: PermissionsRequest) -> PermissionDecision:
     if mode == "plan":
         if tool_name in _READONLY_TOOLS:
             return PermissionDecision(behavior="allow")
+        # plan 工具和 todo 在 plan里面也放行
+        if tool_name in (
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "todo_write",
+            "todo_read",
+        ):
+            return PermissionDecision("allow")
         return PermissionDecision(
             "deny",
             f"plan mode: {tool_name} is not allowed. Only read-only tools can run in plan mode.",

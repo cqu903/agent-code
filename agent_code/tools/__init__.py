@@ -19,4 +19,15 @@ from .base import (  # re-export，消费者零改动
 
 # 顶部 import 各工具模块：触发各自的 @register_tool，把工具并入 _REGISTERED_TOOLS。
 # 这是 Python 惯用的"顶部 import"，不再是 default_tools() 里的延迟导入特例。
-from . import bash_tool, cron, fs, git, memory_tool, misc, web  # noqa: F401
+from . import (
+    bash_tool,
+    cron,
+    fs,
+    git,
+    memory_tool,
+    misc,
+    plan,
+    skills,
+    todo,
+    web,
+)  # noqa: F401

@@ -3,6 +3,7 @@ import difflib
 import typer
 from pathlib import Path
 from rich.console import Console
+from rich.panel import Panel
 
 _terminal_asker = None
 
@@ -81,6 +82,29 @@ def confirm_command(command: str, timeout: int = 30, cwd: Path | None = None) ->
 
 def confirm_tool_use(tool_name: str, detail: str) -> bool:
     return _ask(lambda: typer.confirm(f"Allow {tool_name}: {detail}?", default=False))
+
+
+def confirm_plan(plan_summary: str) -> bool:
+    """渲染计划面板并等用户批准（Day 8 v6 plan 闭环的审批门）。
+
+    和 confirm_edit/confirm_command 同构：Plan 面板 + 确认问题都在 _do 里直接
+    console.print/typer.confirm——不另起 StringIO 缓冲、不走 _write_real_terminal。
+    因为 REPL 下 _ask 会把 _do 经 interactive.run_on_main_terminal 调度进
+    in_terminal，期间 sys.stdout 被临时指回真实终端（见模块顶部 console 注释），
+    所以 console.print 的 Panel 立即可见，不会卡在 patch_stdout 代理里排到
+    确认之后；one-shot 没注入 asker，_do 直接跑、同样打印。"""
+
+    def _do() -> bool:
+        console.print(
+            Panel(
+                plan_summary or "(empty plan)",
+                title="Plan",
+                border_style="blue",
+            )
+        )
+        return typer.confirm("Approve this plan and exit plan mode?", default=False)
+
+    return _ask(_do)
 
 
 def prompt_single_choice(question: str, labels: list[str]) -> str | None:

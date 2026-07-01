@@ -25,13 +25,20 @@ EXPECTED: dict[str, bool] = {
     "echo": True,
     "memory_recall": True,
     "cron_list": True,
+    "todo_read": True,
+    "skill_list": True,
+    "skill_load": True,
     # 写类：有副作用，串行
     "file_write": False,
     "file_edit": False,
     "bash": False,
     "memory_write": False,
+    "todo_write": False,
     "cron_create": False,
     "cron_cancel": False,
+    # 计划模式：翻转权限模式 / 阻塞等批准，串行
+    "enter_plan_mode": False,
+    "exit_plan_mode": False,
     # 交互类 / 网络类：默认串行（前者需用户确认，后者有外部副作用）
     "ask_user_question": False,
     "web_fetch": False,

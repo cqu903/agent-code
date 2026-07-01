@@ -22,6 +22,8 @@ class RuntimeState:
     abort_event: threading.Event = field(default_factory=threading.Event)
     input_queue: queue.Queue[str] = field(default_factory=queue.Queue)
     todo_store: list[TodoItem] = field(default_factory=list)
+    skill_allowed_tools: list[str] | None = None
+    output_style: str | None = None
 
     def cycle_permission_mode(self) -> str:
         """shift+tab 循环：default → acceptEdits → plan → default。只主线程调，无需锁。"""
