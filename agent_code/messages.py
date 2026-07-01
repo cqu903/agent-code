@@ -10,9 +10,7 @@ ProviderFormat = Literal["anthropic", "openai"]
 
 def sanitize_text(text: str) -> str:
     """Remove lone UTF-16 surrogates that break JSON / UTF-8 serialization."""
-    return "".join(
-        "\ufffd" if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text
-    )
+    return "".join("\ufffd" if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text)
 
 
 def sanitize_value(value: Any) -> Any:

@@ -4,6 +4,7 @@
 缩进错误，导致每一次文件编辑都会在 is_dir 检查之后无条件 continue，
 跳过 tools.run()——文件未被修改，agent 却因为收不到 observation 而幻觉成功。
 """
+
 from __future__ import annotations
 
 from pathlib import Path

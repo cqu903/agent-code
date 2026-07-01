@@ -184,12 +184,12 @@ def test_run_on_main_terminal_writes_to_real_stdout_not_patch_stdout_proxy(
         assert "err" not in captured, captured.get("err")
         assert captured["v"] is True
         # 关键不变量：func 输出走真实终端，不进 patch_stdout 代理
-        assert "Run this command?" in real.getvalue(), (
-            "func 输出应直写真实终端（用户才看得见确认）"
-        )
-        assert "Run this command?" not in proxy.getvalue(), (
-            "func 输出不应进 patch_stdout 代理（会被缓冲/被 in_terminal 挡住）"
-        )
+        assert (
+            "Run this command?" in real.getvalue()
+        ), "func 输出应直写真实终端（用户才看得见确认）"
+        assert (
+            "Run this command?" not in proxy.getvalue()
+        ), "func 输出不应进 patch_stdout 代理（会被缓冲/被 in_terminal 挡住）"
     finally:
         stop.set()
         mt.join(timeout=2)

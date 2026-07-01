@@ -160,9 +160,7 @@ def test_stop_hook_emits_final_before_continue(tmp_path: Path) -> None:
     assert finals, f"trace 里没有任何 final: {trace}"
     assert continues, f"trace 里没有任何 continue: {trace}"
     # 关键不变量：第一个 final 必须在第一个 continue 之前
-    assert finals[0] < continues[0], (
-        f"final: 应在 continue: 之前。trace={trace}"
-    )
+    assert finals[0] < continues[0], f"final: 应在 continue: 之前。trace={trace}"
 
 
 def test_stop_hook_ignores_non_wildcard_matcher(tmp_path: Path) -> None:
